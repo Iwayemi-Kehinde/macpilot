@@ -152,12 +152,25 @@ export function NetworkCard({ s }: { s: Snapshot }) {
 
 export function ProcessCard({ s, className }: { s: Snapshot; className?: string }) {
   const [sortBy, setSortBy] = useState<"cpu" | "memory">("cpu");
-  const rows: ProcessInfo[] = sortBy === "cpu" ? s.processes.topByCpu : s.processes.topByMemory;
+  const { total, unreadable, topByCpu, topByMemory } = s.processes;
+  const rows: ProcessInfo[] = sortBy === "cpu" ? topByCpu : topByMemory;
   return (
     <Card
       title="Processes"
       className={className}
-      subtitle={`${s.processes.total} running. CPU is a percent of one core, so ${s.host.logicalCores} cores allow up to ${s.host.logicalCores * 100}%.`}
+      subtitle={
+        <>
+          {total} running. CPU is a percent of one core, so {s.host.logicalCores} cores allow up to{" "}
+          {s.host.logicalCores * 100}%.
+          {unreadable > 0 && (
+            <>
+              {" "}
+              {unreadable} belong to the system or other users; macOS only shows their usage to administrator tools,
+              so they are not ranked here.
+            </>
+          )}
+        </>
+      }
       action={
         <div className="segmented" role="group" aria-label="Sort processes by">
           <button aria-pressed={sortBy === "cpu"} onClick={() => setSortBy("cpu")}>
@@ -176,7 +189,9 @@ export function ProcessCard({ s, className }: { s: Snapshot; className?: string 
               <th>Name</th>
               <th className="num">PID</th>
               <th className="num">CPU</th>
-              <th className="num">Memory</th>
+              <th className="num" title="Resident memory. Activity Monitor's Memory column shows a different measure (footprint).">
+                Resident
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -194,6 +209,9 @@ export function ProcessCard({ s, className }: { s: Snapshot; className?: string 
             ))}
           </tbody>
         </table>
+        {rows.length === 0 && (
+          <p className="muted small">{sortBy === "cpu" ? "Measuring CPU per process…" : "No readable processes."}</p>
+        )}
       </div>
     </Card>
   );

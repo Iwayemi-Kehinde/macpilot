@@ -12,7 +12,7 @@ export function BatteryCard({ state }: { state: PollState<BatteryInfo> }) {
   return (
     <Card title="Battery" subtitle={b?.powerSource ?? undefined} error={state.error}>
       {!b ? (
-        <Loading />
+        <Loading error={state.error} />
       ) : !b.present ? (
         <p className="muted">This Mac has no internal battery.</p>
       ) : (
@@ -118,7 +118,7 @@ export function BatteryHistoryCard({ className }: { className?: string }) {
       }
     >
       {!h ? (
-        <Loading />
+        <Loading error={state.error} />
       ) : (
         <>
           <LineChart

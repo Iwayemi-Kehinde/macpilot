@@ -72,7 +72,7 @@ function App() {
       <main className="grid">
         {!s ? (
           <Card title="System" error={system.error} className="span-3">
-            <Loading />
+            <Loading error={system.error} />
           </Card>
         ) : (
           <>

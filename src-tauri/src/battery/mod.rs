@@ -6,7 +6,9 @@ pub mod ioreg;
 pub mod pmset;
 pub mod profiler;
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -20,6 +22,9 @@ const SYSTEM_PROFILER: &str = "/usr/sbin/system_profiler";
 /// Apple's condition and maximum-capacity values change over weeks, so the
 /// slower `system_profiler` call is cached.
 const PROFILER_TTL: Duration = Duration::from_secs(15 * 60);
+const GAUGE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROFILER_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -151,15 +156,56 @@ fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
-fn run(program: &str, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(program)
+/// Runs a fixed system tool (absolute path, constant arguments, no shell) with a
+/// time limit on both its output and its exit, so a hung tool cannot hold the
+/// battery lock or the sampler thread. A tool that overruns is killed.
+fn run(program: &str, args: &[&str], timeout: Duration) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    let mut child = Command::new(program)
         .args(args)
-        .output()
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .map_err(|e| format!("could not run {program}: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("{program} exited with {}", out.status));
+
+    // Read on another thread so a full pipe cannot stall the child. The channel
+    // bounds the wait even if something keeps the pipe open.
+    let stdout = child.stdout.take().ok_or("stdout was not captured")?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = tx.send(stdout.take(MAX_OUTPUT_BYTES).read_to_end(&mut buf).map(|_| buf));
+    });
+    let overran = || format!("{program} did not finish within {} s", timeout.as_secs());
+
+    let out = match rx.recv_timeout(timeout) {
+        Ok(read) => read.map_err(|e| format!("{program}: {e}")),
+        Err(_) => Err(overran()),
+    };
+    // Tools exit as soon as they close stdout, so this normally returns at once.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if out.is_ok() => break status,
+            Ok(None) if out.is_ok() && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) if out.is_ok() => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(overran());
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(out.err().unwrap_or_else(overran));
+            }
+        }
+    };
+    let out = out?;
+    if !status.success() {
+        return Err(format!("{program} exited with {status}"));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 #[derive(Default)]
@@ -170,8 +216,9 @@ pub struct BatteryReader {
 impl BatteryReader {
     /// Fast read for history sampling: pmset and ioreg only.
     pub fn read_gauge() -> Result<(pmset::PmsetBattery, ioreg::IoregBattery), String> {
-        let pm = pmset::parse(&run(PMSET, &["-g", "batt"])?);
-        let io = ioreg::parse(&run(IOREG, &["-rn", "AppleSmartBattery"])?);
+        let pm = pmset::parse(&run(PMSET, &["-g", "batt"], GAUGE_TIMEOUT)?);
+        // Depth 1 keeps child objects' properties out; -w0 disables line wrapping.
+        let io = ioreg::parse(&run(IOREG, &["-rd1", "-w0", "-n", "AppleSmartBattery"], GAUGE_TIMEOUT)?);
         Ok((pm, io))
     }
 
@@ -188,7 +235,7 @@ impl BatteryReader {
             }
         }
         // A failed call is not cached, so the next read retries.
-        match run(SYSTEM_PROFILER, &["SPPowerDataType", "-json"]) {
+        match run(SYSTEM_PROFILER, &["SPPowerDataType", "-json"], PROFILER_TIMEOUT) {
             Ok(json) => {
                 let parsed = profiler::parse(&json);
                 self.profiler_cache = Some((Instant::now(), parsed.clone()));
@@ -235,6 +282,67 @@ mod tests {
         assert_eq!(b.raw_capacity_percent, None);
         assert_eq!(b.power_w, None);
         assert_eq!(b.notes.len(), 4);
+    }
+
+    #[test]
+    fn run_returns_output_and_reports_failures() {
+        assert_eq!(run("/bin/echo", &["ok"], GAUGE_TIMEOUT).unwrap(), "ok\n");
+        assert!(run("/usr/bin/false", &[], GAUGE_TIMEOUT).unwrap_err().contains("exited"));
+        assert!(run("/nonexistent/tool", &[], GAUGE_TIMEOUT).unwrap_err().contains("could not run"));
+    }
+
+    #[test]
+    fn run_is_bounded_when_a_descendant_keeps_the_pipe_open() {
+        // The shell exits at once but leaves a background sleep holding stdout.
+        let started = Instant::now();
+        let err = run("/bin/sh", &["-c", "/bin/sleep 30 & echo started"], Duration::from_millis(400)).unwrap_err();
+        assert!(err.contains("did not finish"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn run_kills_a_hung_command() {
+        let started = Instant::now();
+        let err = run("/bin/sleep", &["30"], Duration::from_millis(300)).unwrap_err();
+        assert!(err.contains("did not finish"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Every prefix of real output (a truncated read) and pseudo-random bytes
+    /// must parse without panicking and without producing out-of-range values.
+    #[test]
+    fn malformed_output_never_panics_or_invents_values() {
+        let pm_src = include_str!("../../tests/fixtures/pmset_discharging.txt");
+        let io_src = include_str!("../../tests/fixtures/ioreg_battery.txt");
+        let prof_src = include_str!("../../tests/fixtures/system_profiler_power.json");
+        let prefixes = |s: &'static str| s.char_indices().map(move |(i, _)| &s[..i]);
+
+        for p in prefixes(pm_src) {
+            let b = pmset::parse(p);
+            assert!(b.percent.is_none_or(|v| v <= 100));
+        }
+        for p in prefixes(io_src) {
+            let b = ioreg::parse(p);
+            assert!(b.temperature_c.is_none_or(|t| (-20.0..=100.0).contains(&t)));
+        }
+        for p in prefixes(prof_src) {
+            assert!(profiler::parse(p).max_capacity_percent.is_none_or(|v| v <= 100));
+        }
+
+        const NOISE: &[u8] = b"\"=;:%() \n\t0123456789abcYesNo-{}<>";
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..500 {
+            let noise: String = (0..256)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    char::from(NOISE[(seed % NOISE.len() as u64) as usize])
+                })
+                .collect();
+            let b = combine(&pmset::parse(&noise), &ioreg::parse(&noise), &profiler::parse(&noise));
+            assert!(b.percent.is_none_or(|v| v <= 100));
+        }
     }
 
     #[test]

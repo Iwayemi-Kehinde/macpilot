@@ -53,6 +53,10 @@ describe("SystemSnapshotSchema", () => {
     negative.cpu.usagePercent = -3;
     expect(SystemSnapshotSchema.safeParse(negative).success).toBe(false);
 
+    const unreadable = clone(snapshot);
+    unreadable.processes.unreadable = unreadable.processes.total + 1;
+    expect(SystemSnapshotSchema.safeParse(unreadable).success).toBe(false);
+
     const missing = clone(snapshot) as Record<string, unknown>;
     delete missing.memory;
     expect(SystemSnapshotSchema.safeParse(missing).success).toBe(false);

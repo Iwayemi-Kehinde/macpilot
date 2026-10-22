@@ -64,11 +64,14 @@ export const SystemSnapshotSchema = z.object({
       totalTxBytes: bytes,
     }),
   ),
-  processes: z.object({
-    total: z.number().int().nonnegative(),
-    topByCpu: z.array(ProcessSchema),
-    topByMemory: z.array(ProcessSchema),
-  }),
+  processes: z
+    .object({
+      total: z.number().int().nonnegative(),
+      unreadable: z.number().int().nonnegative(),
+      topByCpu: z.array(ProcessSchema),
+      topByMemory: z.array(ProcessSchema),
+    })
+    .refine((p) => p.unreadable <= p.total, "more unreadable processes than processes"),
 });
 
 export const ChargeStateSchema = z.enum([

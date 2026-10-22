@@ -68,6 +68,7 @@ export function Row({ label, children, hint }: { label: string; children: ReactN
   );
 }
 
-export function Loading() {
-  return <p className="muted">Reading…</p>;
+/** Shown until the first reading arrives; an error replaces it rather than sitting beside it. */
+export function Loading({ error }: { error?: string }) {
+  return error ? null : <p className="muted">Reading…</p>;
 }

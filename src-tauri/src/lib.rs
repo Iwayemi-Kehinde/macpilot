@@ -14,6 +14,7 @@ use metrics::{Monitor, SystemSnapshot};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 const RETENTION_SECS: i64 = 30 * 24 * 3600;
+const PRUNE_EVERY_SECS: i64 = 24 * 3600;
 const MAX_HISTORY_HOURS: u32 = 30 * 24;
 
 struct AppState {
@@ -73,12 +74,21 @@ async fn get_battery_history(hours: u32, state: State<'_, AppState>) -> Result<B
     })
 }
 
-/// Records one battery sample a minute. Runs while the app is open; nothing is
-/// sampled while the Mac sleeps or MacPilot is closed.
+fn prune(history: &History) {
+    if let Err(e) = history.prune_before(now_secs() - RETENTION_SECS) {
+        eprintln!("battery history prune failed: {e}");
+    }
+}
+
+/// Records one battery sample a minute and prunes old samples once a day. Runs
+/// while the app is open; nothing is sampled while the Mac sleeps or MacPilot
+/// is closed.
 fn spawn_battery_sampler(history: Arc<Mutex<History>>) {
+    let mut last_prune = now_secs();
     std::thread::spawn(move || loop {
-        if let Ok((pm, io)) = BatteryReader::read_gauge() {
-            if let (true, Some(percent)) = (pm.present, pm.percent) {
+        match BatteryReader::read_gauge() {
+            Err(e) => eprintln!("battery sample skipped: {e}"),
+            Ok((pm, io)) => if let (true, Some(percent)) = (pm.present, pm.percent) {
                 let sample = BatterySample {
                     ts: now_secs(),
                     percent,
@@ -92,8 +102,12 @@ fn spawn_battery_sampler(history: Arc<Mutex<History>>) {
                     if let Err(e) = h.insert(&sample) {
                         eprintln!("battery history insert failed: {e}");
                     }
+                    if sample.ts - last_prune >= PRUNE_EVERY_SECS {
+                        prune(&h);
+                        last_prune = sample.ts;
+                    }
                 }
-            }
+            },
         }
         std::thread::sleep(SAMPLE_INTERVAL);
     });
@@ -110,9 +124,7 @@ fn open_history(app: &tauri::App) -> (History, bool) {
         });
     match opened {
         Ok(h) => {
-            if let Err(e) = h.prune_before(now_secs() - RETENTION_SECS) {
-                eprintln!("battery history prune failed: {e}");
-            }
+            prune(&h);
             (h, true)
         }
         Err(e) => {
@@ -125,7 +137,6 @@ fn open_history(app: &tauri::App) -> (History, bool) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let (history, history_persistent) = open_history(app);
             let history = Arc::new(Mutex::new(history));

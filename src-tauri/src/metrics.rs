@@ -3,12 +3,16 @@
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, MINIMUM_CPU_UPDATE_INTERVAL};
 
 const TOP_PROCESSES: usize = 12;
+
+/// Rates averaged over a longer window than this describe the past, not now
+/// (the window was hidden or the Mac slept), so they are withheld for a sample.
+const MAX_RATE_WINDOW: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +75,8 @@ pub struct ProcessMetrics {
     pub name: String,
     /// Percent of one core, so values above 100 are possible.
     pub cpu_percent: Option<f32>,
+    /// Resident memory. Activity Monitor's Memory column shows the footprint,
+    /// which is a different measure.
     pub memory_bytes: u64,
 }
 
@@ -78,6 +84,11 @@ pub struct ProcessMetrics {
 #[serde(rename_all = "camelCase")]
 pub struct ProcessSummary {
     pub total: usize,
+    /// Processes owned by other users (root, system daemons). macOS does not let
+    /// an unprivileged app read their CPU or memory, so they are left out of the
+    /// rankings instead of being shown as idle.
+    pub unreadable: usize,
+    /// Empty until CPU rates are available.
     pub top_by_cpu: Vec<ProcessMetrics>,
     pub top_by_memory: Vec<ProcessMetrics>,
 }
@@ -100,7 +111,32 @@ pub struct Monitor {
     disks: Disks,
     networks: Networks,
     host: HostInfo,
-    last_refresh: Option<Instant>,
+    cpu_stamp: Option<Stamp>,
+    net_stamp: Option<Stamp>,
+}
+
+#[derive(Clone, Copy)]
+struct Stamp {
+    mono: Instant,
+    wall: SystemTime,
+}
+
+impl Stamp {
+    fn now() -> Self {
+        Self { mono: Instant::now(), wall: SystemTime::now() }
+    }
+
+    /// The window since `self`, if it is fit for a rate. The monotonic clock
+    /// pauses while the Mac sleeps, so wall time is checked too.
+    fn window(self) -> Option<Duration> {
+        rate_window(self.mono.elapsed(), self.wall.elapsed().ok())
+    }
+}
+
+fn rate_window(mono: Duration, wall: Option<Duration>) -> Option<Duration> {
+    let wall = wall?;
+    let fits = |d: Duration| (MINIMUM_CPU_UPDATE_INTERVAL..=MAX_RATE_WINDOW).contains(&d);
+    (fits(mono) && fits(wall)).then_some(mono)
 }
 
 impl Monitor {
@@ -120,24 +156,27 @@ impl Monitor {
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
             host,
-            last_refresh: None,
+            cpu_stamp: None,
+            net_stamp: None,
         }
     }
 
     pub fn snapshot(&mut self) -> SystemSnapshot {
-        let elapsed = self.last_refresh.map(|t| t.elapsed());
-        let rates_ready = elapsed.is_some_and(|e| e >= MINIMUM_CPU_UPDATE_INTERVAL);
-
+        let rates_ready = self.cpu_stamp.and_then(Stamp::window).is_some();
+        self.cpu_stamp = Some(Stamp::now());
         self.sys.refresh_cpu_usage();
-        self.sys.refresh_memory();
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing().with_cpu().with_memory(),
         );
+        self.sys.refresh_memory();
         self.disks.refresh(true);
+
+        // Timed on its own so slow process refreshes do not skew throughput.
+        let net_secs = self.net_stamp.and_then(Stamp::window).map(|d| d.as_secs_f64());
+        self.net_stamp = Some(Stamp::now());
         self.networks.refresh(true);
-        self.last_refresh = Some(Instant::now());
 
         let load = System::load_average();
         let cpu = CpuMetrics {
@@ -178,7 +217,6 @@ impl Monitor {
             })
             .collect();
 
-        let secs = elapsed.map(|e| e.as_secs_f64()).filter(|s| *s > 0.0);
         let mut network: Vec<NetworkMetrics> = self
             .networks
             .list()
@@ -186,18 +224,27 @@ impl Monitor {
             .filter(|(_, n)| n.total_received() + n.total_transmitted() > 0)
             .map(|(name, n)| NetworkMetrics {
                 interface: name.clone(),
-                rx_bytes_per_sec: secs.map(|s| n.received() as f64 / s),
-                tx_bytes_per_sec: secs.map(|s| n.transmitted() as f64 / s),
+                rx_bytes_per_sec: net_secs.map(|s| n.received() as f64 / s),
+                tx_bytes_per_sec: net_secs.map(|s| n.transmitted() as f64 / s),
                 total_rx_bytes: n.total_received(),
                 total_tx_bytes: n.total_transmitted(),
             })
             .collect();
-        network.sort_by(|a, b| (b.total_rx_bytes + b.total_tx_bytes).cmp(&(a.total_rx_bytes + a.total_tx_bytes)));
+        network.sort_by(|a, b| {
+            (b.total_rx_bytes + b.total_tx_bytes)
+                .cmp(&(a.total_rx_bytes + a.total_tx_bytes))
+                .then_with(|| a.interface.cmp(&b.interface))
+        });
 
-        let all: Vec<ProcessMetrics> = self
+        let total = self.sys.processes().len();
+        // Without privileges, other users' processes come back with no memory
+        // (and no start time). Anything without resident memory, those plus
+        // zombies, has nothing to rank.
+        let readable: Vec<ProcessMetrics> = self
             .sys
             .processes()
             .values()
+            .filter(|p| p.memory() != 0)
             .map(|p| ProcessMetrics {
                 pid: p.pid().as_u32(),
                 name: p.name().to_string_lossy().into_owned(),
@@ -206,11 +253,17 @@ impl Monitor {
             })
             .collect();
         let processes = ProcessSummary {
-            total: all.len(),
-            top_by_cpu: top_n(&all, |a, b| {
-                b.cpu_percent.unwrap_or(0.0).partial_cmp(&a.cpu_percent.unwrap_or(0.0)).unwrap_or(Ordering::Equal)
-            }),
-            top_by_memory: top_n(&all, |a, b| b.memory_bytes.cmp(&a.memory_bytes)),
+            total,
+            unreadable: total - readable.len(),
+            top_by_cpu: if rates_ready {
+                top_n(&readable, |a, b| {
+                    let (a_cpu, b_cpu) = (a.cpu_percent.unwrap_or(0.0), b.cpu_percent.unwrap_or(0.0));
+                    b_cpu.total_cmp(&a_cpu).then(a.pid.cmp(&b.pid))
+                })
+            } else {
+                Vec::new()
+            },
+            top_by_memory: top_n(&readable, |a, b| b.memory_bytes.cmp(&a.memory_bytes).then(a.pid.cmp(&b.pid))),
         };
 
         SystemSnapshot {
@@ -243,7 +296,6 @@ mod tests {
         let mut m = Monitor::new();
         let first = m.snapshot();
         assert!(first.cpu.usage_percent.is_none());
-        assert!(first.processes.top_by_cpu.iter().all(|p| p.cpu_percent.is_none()));
         assert!(first.network.iter().all(|n| n.rx_bytes_per_sec.is_none()));
         assert!(first.memory.total_bytes > 0);
         assert!(first.memory.used_bytes <= first.memory.total_bytes);
@@ -252,12 +304,35 @@ mod tests {
         assert!(first.processes.total > 0);
         assert!(first.host.logical_cores > 0);
 
-        std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL + std::time::Duration::from_millis(50));
+        assert!(first.processes.top_by_cpu.is_empty());
+
+        std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL + Duration::from_millis(50));
         let second = m.snapshot();
         let usage = second.cpu.usage_percent.expect("cpu usage after two samples");
         assert!((0.0..=100.0).contains(&usage));
         assert_eq!(second.cpu.per_core_percent.len(), second.host.logical_cores);
-        assert!(second.processes.top_by_cpu.len() <= TOP_PROCESSES);
+        assert!(second.network.iter().all(|n| n.rx_bytes_per_sec.is_some()));
+
+        let procs = &second.processes;
+        assert!(!procs.top_by_cpu.is_empty() && procs.top_by_cpu.len() <= TOP_PROCESSES);
+        assert!(procs.unreadable < procs.total);
+        // Unreadable processes must not be ranked as idle ones.
+        assert!(procs.top_by_memory.iter().all(|p| p.memory_bytes > 0));
+        let cpus: Vec<f32> = procs.top_by_cpu.iter().map(|p| p.cpu_percent.unwrap()).collect();
+        assert!(cpus.windows(2).all(|w| w[0] >= w[1]), "{cpus:?}");
+    }
+
+    #[test]
+    fn rate_window_rejects_too_short_too_long_and_slept() {
+        let secs = Duration::from_secs;
+        assert_eq!(rate_window(secs(2), Some(secs(2))), Some(secs(2)));
+        assert_eq!(rate_window(Duration::from_millis(50), Some(Duration::from_millis(50))), None);
+        // Window hidden for a minute: the average no longer describes now.
+        assert_eq!(rate_window(secs(60), Some(secs(60))), None);
+        // Slept for an hour: the monotonic clock paused, wall time did not.
+        assert_eq!(rate_window(secs(3), Some(secs(3600))), None);
+        // Wall clock moved backwards.
+        assert_eq!(rate_window(secs(2), None), None);
     }
 
     #[test]

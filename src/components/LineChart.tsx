@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type PointerEvent } from "react";
+import { useEffect, useId, useRef, useState, type PointerEvent } from "react";
 
 export interface ChartPoint {
   t: number;
@@ -31,6 +31,7 @@ export function LineChart({
   formatTime,
   ariaLabel,
 }: Props) {
+  const clipId = useId();
   const wrapRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
   const [hover, setHover] = useState<ChartPoint | null>(null);
@@ -59,13 +60,18 @@ export function LineChart({
     if ((!joinPrev && !joinNext) || i === points.length - 1) markers.push(p);
     d += `${joinPrev ? "L" : "M"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`;
   });
+  // Older points can fall before the window (after a refresh-rate change, or
+  // while a new range loads); the clip path hides them and hover ignores them.
+  const visible = points.filter((p) => p.t >= t0 && p.t <= t1);
+  // The window slides while the pointer rests, so a hovered point can leave it.
+  const shown = hover && hover.t >= t0 && hover.t <= t1 ? hover : null;
 
   const onMove = (e: PointerEvent<SVGSVGElement>) => {
-    if (points.length === 0) return;
+    if (visible.length === 0) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const t = t0 + ((e.clientX - rect.left - PAD.left) / Math.max(1, innerW)) * (t1 - t0);
-    let best = points[0];
-    for (const p of points) if (Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
+    let best = visible[0];
+    for (const p of visible) if (Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
     setHover(best);
   };
 
@@ -112,31 +118,36 @@ export function LineChart({
               {formatTime(t)}
             </text>
           ))}
-          <path className="chart-line" d={d} />
-          {markers.map((p) => (
-            <circle key={p.t} className="chart-point" cx={x(p.t)} cy={y(p.v)} r={3} />
-          ))}
-          {hover && (
+          <clipPath id={clipId}>
+            <rect x={PAD.left} y={0} width={innerW + PAD.right} height={PAD.top + innerH + 4} />
+          </clipPath>
+          <g clipPath={`url(#${clipId})`}>
+            <path className="chart-line" d={d} />
+            {markers.map((p) => (
+              <circle key={p.t} className="chart-point" cx={x(p.t)} cy={y(p.v)} r={3} />
+            ))}
+          </g>
+          {shown && (
             <g>
-              <line className="chart-crosshair" x1={x(hover.t)} x2={x(hover.t)} y1={PAD.top} y2={PAD.top + innerH} />
-              <circle className="chart-dot" cx={x(hover.t)} cy={y(hover.v)} r={4} />
+              <line className="chart-crosshair" x1={x(shown.t)} x2={x(shown.t)} y1={PAD.top} y2={PAD.top + innerH} />
+              <circle className="chart-dot" cx={x(shown.t)} cy={y(shown.v)} r={4} />
             </g>
           )}
         </svg>
       )}
-      {hover && (
+      {shown && (
         <div
           className="chart-tooltip"
           style={{
-            left: Math.min(Math.max(x(hover.t), 60), width - 60),
-            top: Math.max(y(hover.v) - 44, 0),
+            left: Math.min(Math.max(x(shown.t), 60), width - 60),
+            top: Math.max(y(shown.v) - 44, 0),
           }}
         >
-          <strong>{formatValue(hover.v)}</strong>
-          <span>{formatTime(hover.t)}</span>
+          <strong>{formatValue(shown.v)}</strong>
+          <span>{formatTime(shown.t)}</span>
         </div>
       )}
-      {points.length === 0 && <div className="chart-empty">No samples yet</div>}
+      {visible.length === 0 && <div className="chart-empty">No samples in this range yet</div>}
     </div>
   );
 }

@@ -1,6 +1,7 @@
 //! Local battery history in SQLite, plus the discharge-rate estimate.
 
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -10,6 +11,9 @@ use serde::Serialize;
 pub const MAX_SAMPLE_GAP_SECS: i64 = 15 * 60;
 const MIN_WINDOW_SECS: i64 = 10 * 60;
 const MIN_SAMPLES: usize = 3;
+/// A sample within this many seconds of an existing one is skipped, so a second
+/// running copy of MacPilot cannot double the history.
+const MIN_SPACING_SECS: i64 = 45;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +63,7 @@ impl History {
     }
 
     fn init(conn: Connection) -> rusqlite::Result<Self> {
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS battery_samples (
                 ts INTEGER NOT NULL,
@@ -74,13 +79,15 @@ impl History {
         Ok(Self { conn })
     }
 
-    pub fn insert(&self, s: &BatterySample) -> rusqlite::Result<()> {
-        self.conn.execute(
+    /// Returns whether the sample was stored.
+    pub fn insert(&self, s: &BatterySample) -> rusqlite::Result<bool> {
+        let inserted = self.conn.execute(
             "INSERT INTO battery_samples (ts, percent, charging, external_power, charge_mah, amperage_ma, voltage_mv)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![s.ts, s.percent, s.charging, s.external_power, s.charge_mah, s.amperage_ma, s.voltage_mv],
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+             WHERE NOT EXISTS (SELECT 1 FROM battery_samples WHERE ts > ?1 - ?8 AND ts < ?1 + ?8)",
+            params![s.ts, s.percent, s.charging, s.external_power, s.charge_mah, s.amperage_ma, s.voltage_mv, MIN_SPACING_SECS],
         )?;
-        Ok(())
+        Ok(inserted == 1)
     }
 
     pub fn since(&self, since_ts: i64) -> rusqlite::Result<Vec<BatterySample>> {
@@ -198,6 +205,33 @@ mod tests {
         assert_eq!(h.since(150).unwrap().len(), 1);
         assert_eq!(h.prune_before(150).unwrap(), 1);
         assert_eq!(h.since(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn skips_samples_too_close_to_an_existing_one() {
+        let h = History::open_in_memory().unwrap();
+        assert!(h.insert(&sample(1000, 80, false, None)).unwrap());
+        // A second MacPilot instance sampling 20 s later, or 20 s earlier.
+        assert!(!h.insert(&sample(1020, 80, false, None)).unwrap());
+        assert!(!h.insert(&sample(980, 80, false, None)).unwrap());
+        assert!(h.insert(&sample(1060, 79, false, None)).unwrap());
+        assert_eq!(h.since(0).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn retention_survives_reopening_the_file() {
+        let path = std::env::temp_dir().join(format!("macpilot-history-test-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let h = History::open(&path).unwrap();
+            h.insert(&sample(100, 90, false, None)).unwrap();
+            h.insert(&sample(10_000, 80, false, None)).unwrap();
+        }
+        let h = History::open(&path).unwrap();
+        assert_eq!(h.prune_before(5_000).unwrap(), 1);
+        assert_eq!(h.since(0).unwrap().iter().map(|s| s.ts).collect::<Vec<_>>(), vec![10_000]);
+        drop(h);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Parser for `ioreg -rn AppleSmartBattery`.
+//! Parser for `ioreg -rd1 -w0 -n AppleSmartBattery`.
 //!
 //! Only top-level `"Key" = value` lines are read. Nested dictionaries such as
 //! `BatteryData` sit on a single line and are kept as opaque values.
@@ -106,6 +106,22 @@ mod tests {
         assert_eq!(b.temperature_c, Some(30.77));
         assert_eq!(b.is_charging, Some(false));
         assert_eq!(b.external_connected, Some(false));
+    }
+
+    /// Captured with the flags the app uses (`-rd1 -w0`), while charging.
+    #[test]
+    fn parses_depth_limited_unwrapped_output_while_charging() {
+        let b = parse(include_str!("../../tests/fixtures/ioreg_battery_d1.txt"));
+        assert_eq!(b.installed, Some(true));
+        assert_eq!(b.cycle_count, Some(555));
+        assert_eq!(b.design_capacity_mah, Some(8694));
+        assert_eq!(b.full_charge_capacity_mah, Some(7625));
+        assert_eq!(b.current_charge_mah, Some(7548));
+        assert_eq!(b.voltage_mv, Some(12794));
+        assert_eq!(b.amperage_ma, Some(388));
+        assert_eq!(b.temperature_c, Some(30.95));
+        assert_eq!(b.is_charging, Some(true));
+        assert_eq!(b.external_connected, Some(true));
     }
 
     #[test]
