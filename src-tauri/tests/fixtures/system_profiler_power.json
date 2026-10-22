@@ -1,0 +1,85 @@
+{
+ "SPPowerDataType": [
+  {
+   "_name": "spbattery_information",
+   "sppower_battery_charge_info": {
+    "sppower_battery_at_warn_level": "FALSE",
+    "sppower_battery_fully_charged": "FALSE",
+    "sppower_battery_is_charging": "FALSE",
+    "sppower_battery_state_of_charge": 86
+   },
+   "sppower_battery_health_info": {
+    "sppower_battery_cycle_count": 555,
+    "sppower_battery_health": "Good",
+    "sppower_battery_health_maximum_capacity": "85%"
+   },
+   "sppower_battery_model_info": {
+    "sppower_battery_cell_revision": "4014",
+    "sppower_battery_device_name": "bq40z651",
+    "sppower_battery_firmware_version": "0b00",
+    "sppower_battery_hardware_revision": "0100",
+    "sppower_battery_pack_lot_code": "0000",
+    "sppower_battery_pcb_lot_code": "0000",
+    "sppower_battery_serial_number": "REDACTED"
+   }
+  },
+  {
+   "_name": "sppower_information",
+   "AC Power": {
+    "Disk Sleep Timer": 10,
+    "Display Sleep Timer": 10,
+    "Hibernate Mode": 3,
+    "LowPowerMode": "No",
+    "PrioritizeNetworkReachabilityOverSleep": "No",
+    "Sleep On Power Button": "Yes",
+    "System Sleep Timer": 1,
+    "Wake On LAN": "Yes"
+   },
+   "Battery Power": {
+    "Current Power Source": "TRUE",
+    "Disk Sleep Timer": 10,
+    "Display Sleep Timer": 2,
+    "Hibernate Mode": 3,
+    "LowPowerMode": "No",
+    "PrioritizeNetworkReachabilityOverSleep": "No",
+    "ReduceBrightness": "Yes",
+    "Sleep On Power Button": "Yes",
+    "System Sleep Timer": 1,
+    "Wake On LAN": "No"
+   }
+  },
+  {
+   "_name": "sppower_hwconfig_information",
+   "sppower_ups_installed": "FALSE"
+  },
+  {
+   "_name": "sppower_ac_charger_information",
+   "sppower_battery_charger_connected": "FALSE",
+   "sppower_battery_is_charging": "FALSE"
+  },
+  {
+   "_items": [
+    {
+     "_items": [
+      {
+       "appPID": 426,
+       "eventtype": "wake",
+       "scheduledby": "com.apple.alarm.user-invisible-com.apple.calaccessd.travelEngine.periodicRefreshTimer",
+       "time": "2026-10-22T18:42:56Z",
+       "UserVisible": false
+      },
+      {
+       "appPID": 90,
+       "eventtype": "wake",
+       "scheduledby": "com.apple.alarm.user-invisible-com.apple.osanalytics.hardhighengagementtimer",
+       "time": "2026-10-22T23:59:26Z",
+       "UserVisible": false
+      }
+     ],
+     "_name": "sppower_scheduled_events_info"
+    }
+   ],
+   "_name": "sppower_events_info"
+  }
+ ]
+}

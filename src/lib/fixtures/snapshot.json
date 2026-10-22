@@ -1,0 +1,115 @@
+{
+  "timestampMs": 1792706646624,
+  "uptimeSecs": 229414,
+  "host": {
+    "hostname": "Example-Mac.local",
+    "osVersion": "macOS 26.6.2 Tahoe",
+    "kernelVersion": "25.6.0",
+    "cpuBrand": "Apple M1 Pro",
+    "physicalCores": 10,
+    "logicalCores": 10
+  },
+  "cpu": {
+    "usagePercent": 22.489857,
+    "perCorePercent": [
+      65.42056,
+      62.616825,
+      23.809525,
+      33.962265,
+      15.74074,
+      8.490566,
+      9.259259,
+      3.7383177,
+      0.93457943,
+      0.9259259
+    ],
+    "loadAverage": [
+      2.73095703125,
+      3.20654296875,
+      3.19189453125
+    ]
+  },
+  "memory": {
+    "totalBytes": 17179869184,
+    "usedBytes": 13067157504,
+    "freeBytes": 143065088,
+    "swapTotalBytes": 6442450944,
+    "swapUsedBytes": 5309071360
+  },
+  "disks": [
+    {
+      "name": "Macintosh HD",
+      "mountPoint": "/",
+      "fileSystem": "apfs",
+      "totalBytes": 494384795648,
+      "availableBytes": 379573847338,
+      "removable": false
+    }
+  ],
+  "network": [
+    {
+      "interface": "en0",
+      "rxBytesPerSec": 32034.929796492066,
+      "txBytesPerSec": 2744101.360208542,
+      "totalRxBytes": 22622158414,
+      "totalTxBytes": 5554824252
+    },
+    {
+      "interface": "llw0",
+      "rxBytesPerSec": 0.0,
+      "txBytesPerSec": 0.0,
+      "totalRxBytes": 4590523386,
+      "totalTxBytes": 146419816
+    },
+    {
+      "interface": "lo0",
+      "rxBytesPerSec": 0.0,
+      "txBytesPerSec": 0.0,
+      "totalRxBytes": 414689364,
+      "totalTxBytes": 414689364
+    }
+  ],
+  "processes": {
+    "total": 538,
+    "topByCpu": [
+      {
+        "pid": 66284,
+        "name": "example-process-1",
+        "cpuPercent": 19.866497,
+        "memoryBytes": 972193792
+      },
+      {
+        "pid": 62106,
+        "name": "example-process-2",
+        "cpuPercent": 19.053698,
+        "memoryBytes": 175898624
+      },
+      {
+        "pid": 65995,
+        "name": "example-process-3",
+        "cpuPercent": 15.210441,
+        "memoryBytes": 381059072
+      }
+    ],
+    "topByMemory": [
+      {
+        "pid": 66284,
+        "name": "example-process-1",
+        "cpuPercent": 19.866497,
+        "memoryBytes": 972193792
+      },
+      {
+        "pid": 19885,
+        "name": "example-process-4",
+        "cpuPercent": 1.4905765,
+        "memoryBytes": 627212288
+      },
+      {
+        "pid": 61418,
+        "name": "example-process-5",
+        "cpuPercent": 0.66267765,
+        "memoryBytes": 551190528
+      }
+    ]
+  }
+}
