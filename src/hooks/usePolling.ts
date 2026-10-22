@@ -10,6 +10,7 @@ export interface PollState<T> {
 /**
  * Calls `fetcher` every `intervalMs`. Stops while the window is hidden so the
  * app costs nothing in the background, and fetches at once when it returns.
+ * The first call is made even while hidden, so the window has data when shown.
  * On failure the last good data is kept, and `error` marks it as stale.
  */
 export function usePolling<T>(fetcher: () => Promise<T>, intervalMs: number): PollState<T> {
@@ -20,9 +21,9 @@ export function usePolling<T>(fetcher: () => Promise<T>, intervalMs: number): Po
     let timer: number | undefined;
     let inFlight = false;
 
-    const tick = async () => {
+    const tick = async (first = false) => {
       window.clearTimeout(timer);
-      if (document.hidden || inFlight) return;
+      if ((document.hidden && !first) || inFlight) return;
       inFlight = true;
       try {
         const data = await fetcher();
@@ -39,7 +40,7 @@ export function usePolling<T>(fetcher: () => Promise<T>, intervalMs: number): Po
       if (!document.hidden) void tick();
     };
 
-    void tick();
+    void tick(true);
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       cancelled = true;

@@ -8,6 +8,7 @@ const sample = (ts: number, externalPower: boolean): BatterySample => ({
   charging: externalPower,
   externalPower,
   chargeMah: null,
+  fullChargeMah: null,
   amperageMa: null,
   voltageMv: null,
 });

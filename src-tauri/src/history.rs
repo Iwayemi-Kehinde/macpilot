@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde::Serialize;
 
 /// Samples further apart than this are treated as separate segments (the Mac
@@ -11,8 +11,9 @@ use serde::Serialize;
 pub const MAX_SAMPLE_GAP_SECS: i64 = 15 * 60;
 const MIN_WINDOW_SECS: i64 = 10 * 60;
 const MIN_SAMPLES: usize = 3;
-/// A sample within this many seconds of an existing one is skipped, so a second
-/// running copy of MacPilot cannot double the history.
+/// A sample within this many seconds of an existing one in the same power state
+/// is skipped, so a second running copy of MacPilot cannot double the history,
+/// while a sample marking the adapter being connected or removed always lands.
 const MIN_SPACING_SECS: i64 = 45;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -24,6 +25,8 @@ pub struct BatterySample {
     pub charging: bool,
     pub external_power: bool,
     pub charge_mah: Option<u32>,
+    /// The gauge's full-charge capacity when the sample was taken.
+    pub full_charge_mah: Option<u32>,
     pub amperage_ma: Option<i64>,
     pub voltage_mv: Option<u32>,
 }
@@ -62,7 +65,7 @@ impl History {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> rusqlite::Result<Self> {
+    fn init(mut conn: Connection) -> rusqlite::Result<Self> {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS battery_samples (
@@ -72,27 +75,52 @@ impl History {
                 external_power INTEGER NOT NULL,
                 charge_mah INTEGER,
                 amperage_ma INTEGER,
-                voltage_mv INTEGER
+                voltage_mv INTEGER,
+                full_charge_mah INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_battery_samples_ts ON battery_samples(ts);",
         )?;
+        // Files created before full_charge_mah existed keep their rows; those read
+        // back as NULL. The write lock stops two copies from both adding it.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_full: bool = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('battery_samples') WHERE name = 'full_charge_mah'",
+            [],
+            |r| r.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_full {
+            tx.execute("ALTER TABLE battery_samples ADD COLUMN full_charge_mah INTEGER", [])?;
+        }
+        tx.commit()?;
         Ok(Self { conn })
     }
 
     /// Returns whether the sample was stored.
     pub fn insert(&self, s: &BatterySample) -> rusqlite::Result<bool> {
         let inserted = self.conn.execute(
-            "INSERT INTO battery_samples (ts, percent, charging, external_power, charge_mah, amperage_ma, voltage_mv)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
-             WHERE NOT EXISTS (SELECT 1 FROM battery_samples WHERE ts > ?1 - ?8 AND ts < ?1 + ?8)",
-            params![s.ts, s.percent, s.charging, s.external_power, s.charge_mah, s.amperage_ma, s.voltage_mv, MIN_SPACING_SECS],
+            "INSERT INTO battery_samples (ts, percent, charging, external_power, charge_mah, amperage_ma, voltage_mv, full_charge_mah)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM battery_samples WHERE ts > ?1 - ?9 AND ts < ?1 + ?9 AND external_power = ?4
+             )",
+            params![
+                s.ts,
+                s.percent,
+                s.charging,
+                s.external_power,
+                s.charge_mah,
+                s.amperage_ma,
+                s.voltage_mv,
+                s.full_charge_mah,
+                MIN_SPACING_SECS
+            ],
         )?;
         Ok(inserted == 1)
     }
 
     pub fn since(&self, since_ts: i64) -> rusqlite::Result<Vec<BatterySample>> {
         let mut stmt = self.conn.prepare(
-            "SELECT ts, percent, charging, external_power, charge_mah, amperage_ma, voltage_mv
+            "SELECT ts, percent, charging, external_power, charge_mah, amperage_ma, voltage_mv, full_charge_mah
              FROM battery_samples WHERE ts >= ?1 ORDER BY ts ASC",
         )?;
         stmt.query_map([since_ts], |r| {
@@ -104,6 +132,7 @@ impl History {
                 charge_mah: r.get(4)?,
                 amperage_ma: r.get(5)?,
                 voltage_mv: r.get(6)?,
+                full_charge_mah: r.get(7)?,
             })
         })?
         .collect()
@@ -142,24 +171,53 @@ pub fn estimate_discharge(samples: &[BatterySample]) -> Result<DischargeEstimate
         ));
     }
 
-    let hours = window_secs as f64 / 3600.0;
-    let drop = first.percent as f64 - last.percent as f64;
-    let percent_per_hour = drop / hours;
-    let average_ma = match (first.charge_mah, last.charge_mah) {
-        (Some(a), Some(b)) => Some((a as f64 - b as f64) / hours),
-        _ => None,
-    };
-    let projected_minutes_to_empty =
-        (percent_per_hour > 0.1).then(|| last.percent as f64 / percent_per_hour * 60.0);
-
     let minutes = window_secs as f64 / 60.0;
-    // pmset reports whole percents, so small drops carry a large rounding error.
-    let (confidence, confidence_reason) = if minutes >= 60.0 && drop >= 5.0 {
-        (Confidence::High, format!("{drop:.0}% drop over {minutes:.0} min of continuous samples."))
-    } else if minutes >= 20.0 && drop >= 2.0 {
-        (Confidence::Medium, format!("{drop:.0}% drop over {minutes:.0} min; percent readings are whole numbers, so the rate may shift by a few %/h."))
-    } else {
-        (Confidence::Low, format!("Only a {drop:.0}% drop over {minutes:.0} min; 1% rounding dominates the result."))
+    // A single sample can miss its gauge reading, so the outermost ones that have it are used.
+    let gauge = run
+        .iter()
+        .find_map(|s| Some((s.ts, s.charge_mah?)))
+        .zip(run.iter().rev().find_map(|s| Some((s.ts, s.charge_mah?))))
+        .filter(|((t0, _), (t1, _))| t1 - t0 >= MIN_WINDOW_SECS)
+        .map(|((t0, first_mah), (t1, held))| {
+            let gauge_minutes = (t1 - t0) as f64 / 60.0;
+            (gauge_minutes, (first_mah as f64 - held as f64) / (gauge_minutes / 60.0), held)
+        });
+    let average_ma = gauge.map(|(_, ma, _)| ma);
+    let full_mah = run.iter().rev().find_map(|s| s.full_charge_mah).filter(|f| *f > 0);
+
+    // The gauge counts charge in mAh, about 100 times finer than the whole
+    // percents pmset reports, so it is used whenever it has a long enough run.
+    let (percent_per_hour, projected_minutes_to_empty, confidence, confidence_reason) = match (gauge, full_mah) {
+        (Some((gauge_minutes, ma, _)), Some(_)) if ma <= 1.0 => (
+            0.0,
+            None,
+            Confidence::Low,
+            format!("The battery gauge's charge did not fall over {gauge_minutes:.0} min, so there is no drain to project."),
+        ),
+        (Some((gauge_minutes, ma, held)), Some(full)) => {
+            let (confidence, reason) = if gauge_minutes >= 60.0 {
+                (Confidence::High, format!("Measured by the battery gauge over {gauge_minutes:.0} min of continuous samples."))
+            } else if gauge_minutes >= 20.0 {
+                (Confidence::Medium, format!("Measured by the battery gauge over {gauge_minutes:.0} min; it follows recent load and settles as samples build up."))
+            } else {
+                (Confidence::Low, format!("Measured by the battery gauge, but only over {gauge_minutes:.0} min, so it reflects whatever ran in that time."))
+            };
+            (ma / full as f64 * 100.0, Some(held as f64 / ma * 60.0), confidence, reason)
+        }
+        _ => {
+            let drop = first.percent as f64 - last.percent as f64;
+            let percent_per_hour = drop / (minutes / 60.0);
+            let projected = (percent_per_hour > 0.1).then(|| last.percent as f64 / percent_per_hour * 60.0);
+            // pmset reports whole percents, so small drops carry a large rounding error.
+            let (confidence, reason) = if minutes >= 60.0 && drop >= 5.0 {
+                (Confidence::High, format!("{drop:.0}% drop over {minutes:.0} min of continuous samples."))
+            } else if minutes >= 20.0 && drop >= 2.0 {
+                (Confidence::Medium, format!("{drop:.0}% drop over {minutes:.0} min; percent readings are whole numbers, so the rate may shift by a few %/h."))
+            } else {
+                (Confidence::Low, format!("Only a {drop:.0}% drop over {minutes:.0} min; 1% rounding dominates the result."))
+            };
+            (percent_per_hour, projected, confidence, reason)
+        }
     };
 
     Ok(DischargeEstimate {
@@ -188,9 +246,14 @@ mod tests {
             charging: false,
             external_power,
             charge_mah,
+            full_charge_mah: None,
             amperage_ma: None,
             voltage_mv: None,
         }
+    }
+
+    fn gauge_sample(ts: i64, percent: u8, charge_mah: u32) -> BatterySample {
+        BatterySample { full_charge_mah: Some(7620), ..sample(ts, percent, false, Some(charge_mah)) }
     }
 
     #[test]
@@ -215,7 +278,9 @@ mod tests {
         assert!(!h.insert(&sample(1020, 80, false, None)).unwrap());
         assert!(!h.insert(&sample(980, 80, false, None)).unwrap());
         assert!(h.insert(&sample(1060, 79, false, None)).unwrap());
-        assert_eq!(h.since(0).unwrap().len(), 2);
+        // The adapter connected 10 s later: recorded at once.
+        assert!(h.insert(&sample(1070, 79, true, None)).unwrap());
+        assert_eq!(h.since(0).unwrap().len(), 3);
     }
 
     #[test]
@@ -273,6 +338,69 @@ mod tests {
         let samples = vec![sample(0, 80, true, None), sample(600, 81, true, None)];
         assert!(estimate_discharge(&samples).is_err());
         assert!(estimate_discharge(&[]).is_err());
+    }
+
+    /// macOS can hold 100% for a while after a full charge while the gauge
+    /// already shows the drain.
+    #[test]
+    fn gauge_rate_is_used_while_the_percent_has_not_moved() {
+        let samples: Vec<_> = (0..=16).map(|m| gauge_sample(m * 60, 100, 7548 - m as u32 * 13)).collect();
+        let e = estimate_discharge(&samples).unwrap();
+        assert_eq!(e.average_ma, Some(780.0));
+        assert_eq!(e.percent_per_hour, 10.24);
+        // 7340 mAh left at 780 mA.
+        assert_eq!(e.projected_minutes_to_empty, Some(565.0));
+        assert_eq!(e.confidence, Confidence::Low);
+        assert!(e.confidence_reason.contains("battery gauge"), "{}", e.confidence_reason);
+    }
+
+    #[test]
+    fn gauge_confidence_grows_with_the_window() {
+        let run = |mins: i64| -> Vec<_> { (0..=mins).map(|m| gauge_sample(m * 60, 90, 7000 - m as u32 * 10)).collect() };
+        assert_eq!(estimate_discharge(&run(25)).unwrap().confidence, Confidence::Medium);
+        assert_eq!(estimate_discharge(&run(60)).unwrap().confidence, Confidence::High);
+    }
+
+    #[test]
+    fn flat_or_rising_gauge_has_no_rate_or_confidence() {
+        let samples: Vec<_> = (0..=60).map(|m| gauge_sample(m * 60, 90, 7000 + (m / 30) as u32 * 10)).collect();
+        let e = estimate_discharge(&samples).unwrap();
+        assert_eq!(e.percent_per_hour, 0.0);
+        assert_eq!(e.projected_minutes_to_empty, None);
+        assert_eq!(e.confidence, Confidence::Low);
+    }
+
+    #[test]
+    fn a_missing_gauge_reading_at_the_start_still_uses_the_gauge() {
+        let mut samples: Vec<_> = (0..=30).map(|m| gauge_sample(m * 60, 100, 7500 - m as u32 * 13)).collect();
+        samples[0].charge_mah = None;
+        let e = estimate_discharge(&samples).unwrap();
+        assert_eq!(e.average_ma, Some(780.0));
+        assert!(e.confidence_reason.contains("battery gauge over 29 min"), "{}", e.confidence_reason);
+    }
+
+    #[test]
+    fn opening_an_old_file_adds_the_new_column() {
+        let path = std::env::temp_dir().join(format!("macpilot-migrate-test-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE battery_samples (ts INTEGER NOT NULL, percent INTEGER NOT NULL, charging INTEGER NOT NULL,
+                 external_power INTEGER NOT NULL, charge_mah INTEGER, amperage_ma INTEGER, voltage_mv INTEGER);
+                 INSERT INTO battery_samples VALUES (100, 90, 0, 0, 7000, -800, 12000);",
+            )
+            .unwrap();
+        }
+        let h = History::open(&path).unwrap();
+        h.insert(&gauge_sample(200, 89, 6990)).unwrap();
+        let all = h.since(0).unwrap();
+        assert_eq!(all[0].full_charge_mah, None);
+        assert_eq!(all[0].charge_mah, Some(7000));
+        assert_eq!(all[1].full_charge_mah, Some(7620));
+        drop(h);
+        History::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

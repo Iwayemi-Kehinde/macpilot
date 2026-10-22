@@ -103,7 +103,6 @@ p {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
   padding: 16px 20px 24px;
-  align-items: start;
 }
 
 .span-2 {

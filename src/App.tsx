@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { getBattery, getSystemSnapshot } from "./lib/api";
 import { formatUptime } from "./lib/format";
+import { loadChoice, saveChoice } from "./lib/prefs";
 import { usePolling } from "./hooks/usePolling";
 import type { ChartPoint } from "./components/LineChart";
 import { BatteryCard, BatteryHistoryCard } from "./components/BatteryPanels";
@@ -10,25 +11,17 @@ import "./App.css";
 
 const INTERVALS = [1000, 2000, 5000, 10000];
 const INTERVAL_KEY = "macpilot.refreshMs";
-const BATTERY_INTERVAL_MS = 30_000;
+const BATTERY_INTERVAL_MS = 10_000;
 const CPU_HISTORY_POINTS = 90;
 
-function loadInterval(): number {
-  try {
-    const v = Number(localStorage.getItem(INTERVAL_KEY));
-    return INTERVALS.includes(v) ? v : 2000;
-  } catch {
-    return 2000;
-  }
-}
-
 function App() {
-  const [intervalMs, setIntervalMs] = useState(loadInterval);
+  const [intervalMs, setIntervalMs] = useState(() => loadChoice(INTERVAL_KEY, INTERVALS, 2000));
   const system = usePolling(getSystemSnapshot, intervalMs);
   const battery = usePolling(getBattery, BATTERY_INTERVAL_MS);
   const [cpuHistory, setCpuHistory] = useState<ChartPoint[]>([]);
 
   const s = system.data;
+  const b = battery.data;
 
   useEffect(() => {
     const usage = s?.cpu.usagePercent;
@@ -38,11 +31,7 @@ function App() {
 
   const changeInterval = (ms: number) => {
     setIntervalMs(ms);
-    try {
-      localStorage.setItem(INTERVAL_KEY, String(ms));
-    } catch {
-      // Preference is only kept for this session.
-    }
+    saveChoice(INTERVAL_KEY, ms);
   };
 
   return (
@@ -92,7 +81,7 @@ function App() {
           </>
         )}
         <BatteryCard state={battery} />
-        <BatteryHistoryCard className="span-2" />
+        <BatteryHistoryCard className="span-2" externalPower={b?.externalPower ?? undefined} />
         {s && (
           <>
             <ProcessCard s={s} className="span-2 row-span-2" />

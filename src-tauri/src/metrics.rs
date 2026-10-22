@@ -6,13 +6,16 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, MINIMUM_CPU_UPDATE_INTERVAL};
+use sysinfo::{DiskRefreshKind, Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, MINIMUM_CPU_UPDATE_INTERVAL};
 
 const TOP_PROCESSES: usize = 12;
 
 /// Rates averaged over a longer window than this describe the past, not now
 /// (the window was hidden or the Mac slept), so they are withheld for a sample.
 const MAX_RATE_WINDOW: Duration = Duration::from_secs(15);
+/// Free space changes slowly, and reading it costs more than the rest of a
+/// snapshot together, so it is re-read this often or when a volume comes or goes.
+const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,7 +31,8 @@ pub struct HostInfo {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CpuMetrics {
-    /// `None` until two samples exist; usage is a rate between refreshes.
+    /// A rate between two refreshes at least 0.2 s apart. Snapshots always
+    /// measure one; `None` stays in the format so readers handle a missing rate.
     pub usage_percent: Option<f32>,
     pub per_core_percent: Vec<f32>,
     pub load_average: [f64; 3],
@@ -61,7 +65,7 @@ pub struct DiskMetrics {
 #[serde(rename_all = "camelCase")]
 pub struct NetworkMetrics {
     pub interface: String,
-    /// `None` on the first sample; rates need a previous reading.
+    /// See `CpuMetrics::usage_percent`.
     pub rx_bytes_per_sec: Option<f64>,
     pub tx_bytes_per_sec: Option<f64>,
     pub total_rx_bytes: u64,
@@ -113,6 +117,7 @@ pub struct Monitor {
     host: HostInfo,
     cpu_stamp: Option<Stamp>,
     net_stamp: Option<Stamp>,
+    disks_read: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -158,20 +163,52 @@ impl Monitor {
             host,
             cpu_stamp: None,
             net_stamp: None,
+            disks_read: Instant::now(),
         }
     }
 
-    pub fn snapshot(&mut self) -> SystemSnapshot {
-        let rates_ready = self.cpu_stamp.and_then(Stamp::window).is_some();
-        self.cpu_stamp = Some(Stamp::now());
+    fn refresh_disks(&mut self) {
+        let mounts = |d: &Disks| d.list().iter().map(|d| d.mount_point().to_path_buf()).collect::<Vec<_>>();
+        let before = mounts(&self.disks);
+        // Listing volumes is cheap; their free space is not.
+        self.disks.refresh_specifics(true, DiskRefreshKind::nothing());
+        if mounts(&self.disks) != before || self.disks_read.elapsed() >= DISK_REFRESH_INTERVAL {
+            self.disks.refresh_specifics(true, DiskRefreshKind::nothing().with_storage());
+            self.disks_read = Instant::now();
+        }
+    }
+
+    fn refresh_rates(&mut self) {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
             ProcessRefreshKind::nothing().with_cpu().with_memory(),
         );
+    }
+
+    /// Blocks for up to `MINIMUM_CPU_UPDATE_INTERVAL` when it needs a fresh
+    /// rate window, so call it off the async runtime.
+    pub fn snapshot(&mut self) -> SystemSnapshot {
+        match self.cpu_stamp.map(|s| (s.mono.elapsed(), s.window())) {
+            // Called again within the minimum interval: wait out the rest.
+            Some((elapsed, _)) if elapsed < MINIMUM_CPU_UPDATE_INTERVAL => {
+                std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL - elapsed)
+            }
+            Some((_, Some(_))) => {}
+            // First call, or the last one was too long ago (window hidden, Mac
+            // asleep) to describe now: take a fresh short sample instead.
+            _ => {
+                self.refresh_rates();
+                self.networks.refresh(true);
+                self.net_stamp = Some(Stamp::now());
+                std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
+            }
+        }
+        self.cpu_stamp = Some(Stamp::now());
+        self.refresh_rates();
         self.sys.refresh_memory();
-        self.disks.refresh(true);
+        self.refresh_disks();
 
         // Timed on its own so slow process refreshes do not skew throughput.
         let net_secs = self.net_stamp.and_then(Stamp::window).map(|d| d.as_secs_f64());
@@ -180,12 +217,8 @@ impl Monitor {
 
         let load = System::load_average();
         let cpu = CpuMetrics {
-            usage_percent: rates_ready.then(|| self.sys.global_cpu_usage()),
-            per_core_percent: if rates_ready {
-                self.sys.cpus().iter().map(|c| c.cpu_usage()).collect()
-            } else {
-                Vec::new()
-            },
+            usage_percent: Some(self.sys.global_cpu_usage()),
+            per_core_percent: self.sys.cpus().iter().map(|c| c.cpu_usage()).collect(),
             load_average: [load.one, load.five, load.fifteen],
         };
 
@@ -248,21 +281,17 @@ impl Monitor {
             .map(|p| ProcessMetrics {
                 pid: p.pid().as_u32(),
                 name: p.name().to_string_lossy().into_owned(),
-                cpu_percent: rates_ready.then(|| p.cpu_usage()),
+                cpu_percent: Some(p.cpu_usage()),
                 memory_bytes: p.memory(),
             })
             .collect();
         let processes = ProcessSummary {
             total,
             unreadable: total - readable.len(),
-            top_by_cpu: if rates_ready {
-                top_n(&readable, |a, b| {
-                    let (a_cpu, b_cpu) = (a.cpu_percent.unwrap_or(0.0), b.cpu_percent.unwrap_or(0.0));
-                    b_cpu.total_cmp(&a_cpu).then(a.pid.cmp(&b.pid))
-                })
-            } else {
-                Vec::new()
-            },
+            top_by_cpu: top_n(&readable, |a, b| {
+                let (a_cpu, b_cpu) = (a.cpu_percent.unwrap_or(0.0), b.cpu_percent.unwrap_or(0.0));
+                b_cpu.total_cmp(&a_cpu).then(a.pid.cmp(&b.pid))
+            }),
             top_by_memory: top_n(&readable, |a, b| b.memory_bytes.cmp(&a.memory_bytes).then(a.pid.cmp(&b.pid))),
         };
 
@@ -290,13 +319,15 @@ fn top_n(all: &[ProcessMetrics], cmp: impl Fn(&ProcessMetrics, &ProcessMetrics) 
 mod tests {
     use super::*;
 
-    /// Reads the live system: first sample withholds rates, the second has them.
+    /// Reads the live system: the first call measures a short window of its own,
+    /// and a call within the minimum interval waits for one instead of skipping rates.
     #[test]
-    fn live_snapshot_withholds_rates_until_second_sample() {
+    fn live_snapshot_always_has_rates() {
         let mut m = Monitor::new();
         let first = m.snapshot();
-        assert!(first.cpu.usage_percent.is_none());
-        assert!(first.network.iter().all(|n| n.rx_bytes_per_sec.is_none()));
+        assert!(first.cpu.usage_percent.is_some());
+        assert!(first.network.iter().all(|n| n.rx_bytes_per_sec.is_some()));
+        assert!(!first.processes.top_by_cpu.is_empty());
         assert!(first.memory.total_bytes > 0);
         assert!(first.memory.used_bytes <= first.memory.total_bytes);
         let mounts: Vec<_> = first.disks.iter().map(|d| d.mount_point.as_str()).collect();
@@ -304,11 +335,10 @@ mod tests {
         assert!(first.processes.total > 0);
         assert!(first.host.logical_cores > 0);
 
-        assert!(first.processes.top_by_cpu.is_empty());
-
-        std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL + Duration::from_millis(50));
+        let started = Instant::now();
         let second = m.snapshot();
-        let usage = second.cpu.usage_percent.expect("cpu usage after two samples");
+        assert!(started.elapsed() >= MINIMUM_CPU_UPDATE_INTERVAL / 2, "waited {:?}", started.elapsed());
+        let usage = second.cpu.usage_percent.expect("cpu usage after the minimum interval");
         assert!((0.0..=100.0).contains(&usage));
         assert_eq!(second.cpu.per_core_percent.len(), second.host.logical_cores);
         assert!(second.network.iter().all(|n| n.rx_bytes_per_sec.is_some()));

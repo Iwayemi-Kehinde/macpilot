@@ -1,7 +1,8 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getBatteryHistory } from "../lib/api";
 import { externalPowerRanges, isHealthyCondition, STATE_LABEL, thinSamples } from "../lib/battery";
 import { formatClock, formatDayClock, formatMinutes, formatPercent } from "../lib/format";
+import { loadChoice, saveChoice } from "../lib/prefs";
 import type { BatteryInfo } from "../lib/schemas";
 import { usePolling, type PollState } from "../hooks/usePolling";
 import { LineChart } from "./LineChart";
@@ -82,15 +83,33 @@ export function BatteryCard({ state }: { state: PollState<BatteryInfo> }) {
 }
 
 const RANGES = [
+  { hours: 1, label: "1 h" },
   { hours: 6, label: "6 h" },
   { hours: 24, label: "24 h" },
   { hours: 24 * 7, label: "7 d" },
 ];
 
-export function BatteryHistoryCard({ className }: { className?: string }) {
-  const [hours, setHours] = useState(24);
+const RANGE_KEY = "macpilot.historyHours";
+
+/** Reloads at once when `externalPower` changes, since the backend records that change as it happens. */
+export function BatteryHistoryCard({ className, externalPower }: { className?: string; externalPower?: boolean }) {
+  const [hours, setHours] = useState(() =>
+    loadChoice(
+      RANGE_KEY,
+      RANGES.map((r) => r.hours),
+      6,
+    ),
+  );
   const [showTable, setShowTable] = useState(false);
-  const fetcher = useCallback(() => getBatteryHistory(hours), [hours]);
+  const [reloads, setReloads] = useState(0);
+  const lastPower = useRef(externalPower);
+  useEffect(() => {
+    if (externalPower === undefined) return;
+    if (lastPower.current !== undefined && lastPower.current !== externalPower) setReloads((n) => n + 1);
+    lastPower.current = externalPower;
+  }, [externalPower]);
+  // reloads is listed only so that an adapter change fetches again.
+  const fetcher = useCallback(() => getBatteryHistory(hours), [hours, reloads]);
   const state = usePolling(fetcher, 60_000);
   const h = state.data;
   const now = state.updatedAt ?? Date.now();
@@ -110,7 +129,14 @@ export function BatteryHistoryCard({ className }: { className?: string }) {
       action={
         <div className="segmented" role="group" aria-label="History range">
           {RANGES.map((r) => (
-            <button key={r.hours} aria-pressed={hours === r.hours} onClick={() => setHours(r.hours)}>
+            <button
+              key={r.hours}
+              aria-pressed={hours === r.hours}
+              onClick={() => {
+                setHours(r.hours);
+                saveChoice(RANGE_KEY, r.hours);
+              }}
+            >
               {r.label}
             </button>
           ))}
@@ -139,7 +165,9 @@ export function BatteryHistoryCard({ className }: { className?: string }) {
             {e ? (
               <>
                 <p>
-                  <strong>{e.percentPerHour.toFixed(1)} %/h</strong>
+                  <strong title="Percent of the battery's current full charge per hour">
+                    {e.percentPerHour.toFixed(1)} %/h
+                  </strong>
                   {e.averageMa !== null && <span className="muted"> · average {e.averageMa} mA</span>}
                   {e.projectedMinutesToEmpty !== null && (
                     <span className="muted"> · about {formatMinutes(e.projectedMinutesToEmpty)} to empty at this rate</span>

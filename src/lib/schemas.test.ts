@@ -109,8 +109,8 @@ describe("BatteryInfoSchema", () => {
 describe("BatteryHistorySchema", () => {
   const base = {
     samples: [
-      { ts: 1000, percent: 90, charging: false, externalPower: false, chargeMah: 7000, amperageMa: -900, voltageMv: 12300 },
-      { ts: 1060, percent: 90, charging: false, externalPower: false, chargeMah: null, amperageMa: null, voltageMv: null },
+      { ts: 1000, percent: 90, charging: false, externalPower: false, chargeMah: 7000, fullChargeMah: 7620, amperageMa: -900, voltageMv: 12300 },
+      { ts: 1060, percent: 90, charging: false, externalPower: false, chargeMah: null, fullChargeMah: null, amperageMa: null, voltageMv: null },
     ],
     discharge: null,
     dischargeUnavailableReason: "Collecting data",

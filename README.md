@@ -9,11 +9,8 @@ A lightweight system monitor for Apple Silicon Macs, built with Tauri 2, React, 
 - Rust stable, installed per user with rustup into `~/.cargo`
 - Node.js 20 or newer with npm
 
-Rust was installed with `--no-modify-path`, so add Cargo to your shell once:
-
-```sh
-echo '. "$HOME/.cargo/env"' >> ~/.zprofile
-```
+Rust was installed with `--no-modify-path`. The npm scripts add `~/.cargo/bin` to `PATH` themselves, so
+`npm run tauri dev` and `npm run test:rust` work without changing your shell profile.
 
 ## Commands
 
@@ -31,7 +28,7 @@ npm run tauri build    # release build, output in src-tauri/target/release/bundl
 src-tauri/src/
   metrics.rs           CPU, memory, disks, network, processes (sysinfo)
   battery/pmset.rs     parser for `pmset -g batt`
-  battery/ioreg.rs     parser for `ioreg -rn AppleSmartBattery`
+  battery/ioreg.rs     parser for `ioreg -rd1 -w0 -n AppleSmartBattery`
   battery/profiler.rs  parser for `system_profiler SPPowerDataType -json`
   battery/mod.rs       combines the three into one BatteryInfo
   history.rs           SQLite battery history and discharge-rate estimate
@@ -62,14 +59,16 @@ The UI only talks to Rust through three read-only commands: `get_system_snapshot
 |---|---|
 | CPU, per-core usage, load average | sysinfo (Mach host statistics) |
 | Memory used | sysinfo: app + wired + compressed, the same definition as Activity Monitor |
-| Disks, network | sysinfo |
+| Disks | sysinfo; free space is re-read every 30 s or when a volume is mounted or ejected, since reading it costs more than the rest of a refresh |
+| Network | sysinfo |
 | Processes | sysinfo: CPU per process and resident memory, for processes this user can read |
 | Battery percent, state, time remaining | `pmset -g batt` (the macOS estimate) |
 | Cycle count, capacities, voltage, current, temperature | `ioreg` AppleSmartBattery |
 | Maximum capacity and condition | `system_profiler SPPowerDataType`, cached for 15 minutes |
 
 Battery history is stored at `~/Library/Application Support/com.macpilot.desktop/battery_history.sqlite`,
-one sample a minute while the app is open, kept for 30 days.
+one sample a minute while the app is open, kept for 30 days. The battery card itself refreshes every 10 s while
+the window is visible.
 
 ## Limitations
 
@@ -78,19 +77,21 @@ one sample a minute while the app is open, kept for 30 days.
   not rank them. Total CPU and memory still include them.
 - Process memory is resident size. Activity Monitor's Memory column shows the footprint, a different measure.
 - Polling stops whenever macOS reports the window hidden: minimized, app hidden, or fully covered by other
-  windows. After more than 15 s hidden, or after sleep, the first reading shows "Measuring" rather than an
-  average over the gap.
+  windows. One reading is still taken at launch so the window has data when it is first shown.
 - The battery sampler keeps running while the app is open, hidden or not: one `pmset` and one `ioreg` call a
-  minute. If two copies run, samples closer than 45 s to an existing one are skipped.
-- Cost while visible, measured at the 1 s refresh: about 5-7% of one core for the Rust backend plus roughly
-  the same again for WebKit's content and GPU processes. Hidden: about 0.1% for the backend.
-- Rates (CPU usage, per-process CPU, network throughput) need two samples, so the first reading shows
-  "Measuring" instead of a number.
+  minute. If two copies run, samples closer than 45 s to an existing one in the same power state are skipped.
+  Connecting or removing the adapter is recorded at once while the window is visible.
+- Cost while visible, measured at the 1 s refresh: about 4% of one core for the Rust backend (dev build).
+  WebKit's content and GPU processes added roughly 5-10% more when last measured. Hidden: about 0.1%.
+- Rates (CPU usage, per-process CPU, network throughput) need two samples. The first reading, and the first
+  after more than 15 s hidden or after sleep, is measured over a fresh 0.2 s window instead of averaging over
+  the gap, so it is noisier than later readings.
 - Per-process CPU is a percent of one core; a 10-core Mac can show up to 1000% in total.
 - Battery history only covers time when MacPilot is running. Sleep and closed periods show as gaps, and
   the discharge rate is measured only over the latest unbroken stretch on battery.
-- pmset reports whole percents, so short windows give low-confidence drain rates. The confidence and its
-  reason are shown next to every estimate.
+- The drain rate comes from the battery gauge's charge counter (mAh), which still moves while macOS holds
+  the displayed charge at 100%. Samples without gauge readings fall back to pmset's whole percents, where
+  short windows give low-confidence rates. The confidence and its reason are shown next to every estimate.
 - Gauge capacity (full charge over design capacity) can differ from Apple's "Maximum Capacity", which
   uses its own calculation. Both are shown and labelled.
 - Per-process energy impact is not shown yet. The accurate source (`powermetrics`) needs root, which

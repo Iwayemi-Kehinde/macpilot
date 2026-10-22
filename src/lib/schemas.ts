@@ -116,6 +116,7 @@ export const BatterySampleSchema = z.object({
   charging: z.boolean(),
   externalPower: z.boolean(),
   chargeMah: z.number().int().nonnegative().nullable(),
+  fullChargeMah: z.number().int().positive().nullable(),
   amperageMa: z.number().int().nullable(),
   voltageMv: z.number().int().positive().nullable(),
 });

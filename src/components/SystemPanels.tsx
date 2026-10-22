@@ -110,17 +110,25 @@ export function DiskCard({ s }: { s: Snapshot }) {
   );
 }
 
+const ETHERNET_OR_WIFI = /^en\d/;
+const MAX_FALLBACK_INTERFACES = 6;
+
 const IFACE_KIND: [RegExp, string][] = [
   [/^lo\d/, "Loopback"],
   [/^utun\d/, "Tunnel (VPN or system service)"],
   [/^awdl\d/, "Apple Wireless Direct Link (AirDrop)"],
   [/^llw\d/, "Low-latency WLAN"],
   [/^bridge\d/, "Bridge"],
-  [/^en\d/, "Ethernet or Wi-Fi"],
+  [ETHERNET_OR_WIFI, "Ethernet or Wi-Fi"],
 ];
 
 export function NetworkCard({ s }: { s: Snapshot }) {
-  const shown = s.network.slice(0, 6);
+  const [showAll, setShowAll] = useState(false);
+  const main = s.network.filter((n) => ETHERNET_OR_WIFI.test(n.interface));
+  const others = s.network.filter((n) => !ETHERNET_OR_WIFI.test(n.interface));
+  // Loopback, tunnels and AirDrop links are internal to macOS. A Mac with no
+  // Ethernet or Wi-Fi traffic shows the busiest of them instead.
+  const shown = showAll ? [...main, ...others] : main.length > 0 ? main : others.slice(0, MAX_FALLBACK_INTERFACES);
   return (
     <Card title="Network" subtitle="Interfaces with traffic since boot">
       <ul className="list">
@@ -146,6 +154,11 @@ export function NetworkCard({ s }: { s: Snapshot }) {
           </li>
         ))}
       </ul>
+      {main.length > 0 && others.length > 0 && (
+        <button className="link" onClick={() => setShowAll((v) => !v)} aria-expanded={showAll}>
+          {showAll ? "Hide" : "Show"} {others.length} system interfaces (loopback, tunnels, AirDrop)
+        </button>
+      )}
     </Card>
   );
 }
