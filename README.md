@@ -62,19 +62,24 @@ The UI only talks to Rust through three read-only commands: `get_system_snapshot
 |---|---|
 | CPU, per-core usage, load average | sysinfo (Mach host statistics) |
 | Memory used, app, wired, compressed, cached files | Kernel page counts (`host_statistics64`) with Activity Monitor's definitions: used = installed minus free and file-backed pages, app = anonymous minus purgeable, cached files = file-backed plus purgeable |
-| Disks | sysinfo; free space is re-read every 30 s or when a volume is mounted or ejected, since reading it costs more than the rest of a refresh |
+| Disks | sysinfo; available space is Finder's figure, which counts purgeable files macOS removes when it needs room (Disk Utility's "free" leaves them out). Volumes that do not report it, such as mounted disk images, show plain free space. It is re-read every 30 s or when a volume is mounted or ejected, since reading it costs more than the rest of a refresh |
 | Network | sysinfo |
 | Processes | `ps` lists every process with its owner and CPU time, rounded to 10 ms; zombies are left out, as in `top`. Names come from the kernel (`proc_pidpath`). For your own processes the kernel (`proc_pid_rusage`) gives an exact CPU time and the physical footprint, the measure in Activity Monitor's Memory column |
 | Battery percent, state, time remaining | `pmset -g batt` (the macOS estimate) |
 | Cycle count, capacities, voltage, current, temperature | `ioreg` AppleSmartBattery |
-| Maximum capacity and condition | `system_profiler SPPowerDataType`, cached for 15 minutes |
+| Maximum capacity and condition | `system_profiler SPPowerDataType`, cached for 15 minutes. Its JSON names the condition internally ("Good"); MacPilot shows macOS's wording ("Normal", or "Service Recommended") from the report's own string table |
 
 Checked against macOS 26.6 on an M1 Pro: the five memory figures match Activity Monitor's Memory tab to the
 hundredth of a GB when read in the same second, and per-process CPU matches `top` within a point (a process
 burning a steady 28% of one core read 28.1 to 28.5% in MacPilot and 27.9 to 28.9% in `top` over the same
-seconds). Memory Used is about 0.8 GB more than App + Wired + Compressed, as in Activity Monitor, because
-purgeable pages and the memory the kernel keeps outside its page lists count as used; Memory Used plus Cached
-Files can therefore exceed the installed memory.
+seconds). Total CPU under a steady load matched `top` second by second within about a point (53.1% against
+52.9%, 54.4% against 54.2%). 20.00 MB/s sent over loopback read 19.97 to 20.18 MB/s, 20.06 on average, as
+packet headers add a little. Swap, load average, available disk space, cycle count, maximum capacity and
+condition equal what `vm.swapusage`, `sysctl`, Finder's figure and `system_profiler` report. Over a 6.5-hour
+run on battery the percentage fell from 92% to 39%, 8.18 points an hour, and MacPilot's rate read 8.12.
+Memory Used is about 0.8 GB more than App + Wired + Compressed, as in Activity Monitor, because purgeable
+pages and the memory the kernel keeps outside its page lists count as used; Memory Used plus Cached Files can
+therefore exceed the installed memory.
 
 Battery history is stored at `~/Library/Application Support/com.macpilot.desktop/battery_history.sqlite`,
 one sample a minute while the app is open, kept for 30 days. The battery card itself refreshes every 10 s while
@@ -104,8 +109,19 @@ the window is visible.
 - Battery history only covers time when MacPilot is running. Sleep and closed periods show as gaps, and
   the discharge rate is measured only over the latest unbroken stretch on battery.
 - The drain rate comes from the battery gauge's charge counter (mAh), which still moves while macOS holds
-  the displayed charge at 100%. Samples without gauge readings fall back to pmset's whole percents, where
-  short windows give low-confidence rates. The confidence and its reason are shown next to every estimate.
+  the displayed charge at 100%, and is given in points of the percentage macOS shows. That percentage falls
+  about 7% faster than the gauge's share of its full charge on the M1 Pro it was checked on, so MacPilot fits
+  one against the other over the last 7 days on battery and converts with that line. The share is fitted,
+  not mAh, because the gauge keeps relearning its full charge (7588 to 7701 mAh within a few hours here); the
+  fitted line is within about half a point of every reading. Until MacPilot has read 11 different
+  percentages on battery, the rate is the gauge's share and says so. Under the line's 0% point the time to
+  empty uses the percentage macOS shows.
+- The estimate always reads the last 7 days, whatever range the chart shows, and gives no rate when the
+  newest reading is more than 15 minutes old. Samples without gauge readings fall back to pmset's whole
+  percents, where short windows give low-confidence rates. The confidence and its reason are shown next to
+  every estimate.
+- "Time remaining" on the battery card is macOS's own estimate from recent power use; the history card's
+  "to empty" uses the average since unplugging, so the two differ when the load changes.
 - Gauge capacity (full charge over design capacity) can differ from Apple's "Maximum Capacity", which
   uses its own calculation. Both are shown and labelled.
 - Per-process energy impact is not shown yet. The accurate source (`powermetrics`) needs root, which
