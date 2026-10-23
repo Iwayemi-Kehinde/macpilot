@@ -56,23 +56,41 @@ export function CpuCard({
   );
 }
 
+const KERNEL_UNANSWERED = "macOS did not return its memory statistics";
+const USED_HINT =
+  "Installed memory less free pages and file-backed cache, the figure Activity Monitor calls Memory Used. " +
+  "App, wired and compressed memory add up to less, since purgeable pages and memory the kernel reserves are not in them.";
+
 export function MemoryCard({ s }: { s: Snapshot }) {
   const m = s.memory;
+  const b = m.breakdown;
+  const part = (v: number | undefined) =>
+    v !== undefined ? formatBytes(v, 1024) : <Unavailable reason={KERNEL_UNANSWERED} />;
   return (
-    <Card title="Memory" subtitle={`${formatBytes(m.totalBytes, 1024)} installed`}>
+    <Card
+      title="Memory"
+      subtitle={`${formatBytes(m.totalBytes, 1024)} installed${b ? " · the same measures as Activity Monitor" : ""}`}
+    >
       <div className="hero">
         <span className="hero-value">{formatBytes(m.usedBytes, 1024)}</span>
-        <span className="hero-label">used of {formatBytes(m.totalBytes, 1024)}</span>
+        <span className="hero-label" title={b ? USED_HINT : undefined}>
+          used of {formatBytes(m.totalBytes, 1024)}
+        </span>
       </div>
       <Meter value={m.usedBytes / m.totalBytes} label="Memory used" />
       <dl className="rows">
-        <Row label="Used" hint="App memory + wired + compressed, the same definition as Activity Monitor's Memory Used">
-          {formatPercent((m.usedBytes / m.totalBytes) * 100)}
+        <Row label="App memory" hint="Memory apps are using, not counting caches they let macOS reclaim">
+          {part(b?.appBytes)}
         </Row>
-        <Row label="Cached files and free" hint="Memory macOS can reclaim or hand out right away">
-          {formatBytes(m.totalBytes - m.usedBytes, 1024)}
+        <Row label="Wired memory" hint="Memory macOS keeps in place for itself; it cannot be compressed or swapped">
+          {part(b?.wiredBytes)}
         </Row>
-        <Row label="Free pages">{formatBytes(m.freeBytes, 1024)}</Row>
+        <Row label="Compressed" hint="Space taken by memory macOS compressed to make room">
+          {part(b?.compressedBytes)}
+        </Row>
+        <Row label="Cached files" hint="Recently used files kept in memory; macOS frees it whenever apps need room">
+          {part(b?.cachedFilesBytes)}
+        </Row>
         <Row label="Swap used">
           {m.swapTotalBytes > 0
             ? `${formatBytes(m.swapUsedBytes, 1024)} of ${formatBytes(m.swapTotalBytes, 1024)}`
@@ -165,7 +183,14 @@ export function NetworkCard({ s }: { s: Snapshot }) {
 
 export function ProcessCard({ s, className }: { s: Snapshot; className?: string }) {
   const [sortBy, setSortBy] = useState<"cpu" | "memory">("cpu");
-  const { total, unreadable, topByCpu, topByMemory } = s.processes;
+  const { total, system, error, topByCpu, topByMemory } = s.processes;
+  if (error) {
+    return (
+      <Card title="Processes" className={className} error={`Processes could not be read: ${error}`}>
+        {null}
+      </Card>
+    );
+  }
   const rows: ProcessInfo[] = sortBy === "cpu" ? topByCpu : topByMemory;
   return (
     <Card
@@ -175,13 +200,14 @@ export function ProcessCard({ s, className }: { s: Snapshot; className?: string 
         <>
           {total} running. CPU is a percent of one core, so {s.host.logicalCores} cores allow up to{" "}
           {s.host.logicalCores * 100}%.
-          {unreadable > 0 && (
+          {system > 0 && (
             <>
               {" "}
-              {unreadable} belong to the system or other users; macOS only shows their usage to administrator tools,
-              so they are not ranked here.
+              {system} belong to macOS or other users: they are ranked by CPU, but macOS shows their memory only to
+              administrator tools, so the Memory view lists your own processes.
             </>
-          )}
+          )}{" "}
+          kernel_task is not visible to apps.
         </>
       }
       action={
@@ -202,8 +228,8 @@ export function ProcessCard({ s, className }: { s: Snapshot; className?: string 
               <th>Name</th>
               <th className="num">PID</th>
               <th className="num">CPU</th>
-              <th className="num" title="Resident memory. Activity Monitor's Memory column shows a different measure (footprint).">
-                Resident
+              <th className="num" title="Physical footprint, the same measure as Activity Monitor's Memory column">
+                Memory
               </th>
             </tr>
           </thead>
@@ -217,7 +243,13 @@ export function ProcessCard({ s, className }: { s: Snapshot; className?: string 
                 <td className="num">
                   {p.cpuPercent !== null ? formatPercent(p.cpuPercent, 1) : <Unavailable reason="Needs a second sample" />}
                 </td>
-                <td className="num">{formatBytes(p.memoryBytes, 1024)}</td>
+                <td className="num">
+                  {p.memoryBytes !== null ? (
+                    formatBytes(p.memoryBytes, 1024)
+                  ) : (
+                    <Unavailable reason="macOS shows system processes' memory only to administrator tools" />
+                  )}
+                </td>
               </tr>
             ))}
           </tbody>

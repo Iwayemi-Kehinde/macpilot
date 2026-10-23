@@ -1,6 +1,9 @@
 mod battery;
 mod history;
+mod macos;
 mod metrics;
+mod processes;
+mod tool;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -1,6 +1,6 @@
 {
-  "timestampMs": 1792709430911,
-  "uptimeSecs": 232198,
+  "timestampMs": 1792718604757,
+  "uptimeSecs": 241372,
   "host": {
     "hostname": "Example-Mac.local",
     "osVersion": "macOS 26.6.2 Tahoe",
@@ -10,31 +10,36 @@
     "logicalCores": 10
   },
   "cpu": {
-    "usagePercent": 14.305487,
+    "usagePercent": 15.912994,
     "perCorePercent": [
-      35.51402,
-      35.51402,
-      23.148148,
-      25.0,
-      11.926605,
-      8.256881,
-      2.777778,
-      0.9174312,
-      0.0,
+      50.48544,
+      46.601944,
+      18.446602,
+      20.38835,
+      9.615385,
+      6.7961164,
+      4.8543687,
+      0.9708738,
+      0.9708738,
       0.0
     ],
     "loadAverage": [
-      3.67578125,
-      2.91845703125,
-      2.69921875
+      3.6923828125,
+      3.09765625,
+      3.2890625
     ]
   },
   "memory": {
     "totalBytes": 17179869184,
-    "usedBytes": 11585781760,
-    "freeBytes": 552026112,
-    "swapTotalBytes": 6442450944,
-    "swapUsedBytes": 4889640960
+    "usedBytes": 13686734848,
+    "breakdown": {
+      "appBytes": 4660510720,
+      "wiredBytes": 2889367552,
+      "compressedBytes": 5651775488,
+      "cachedFilesBytes": 3195027456
+    },
+    "swapTotalBytes": 5368709120,
+    "swapUsedBytes": 3579117568
   },
   "disks": [
     {
@@ -42,74 +47,248 @@
       "mountPoint": "/",
       "fileSystem": "apfs",
       "totalBytes": 494384795648,
-      "availableBytes": 377435383082,
+      "availableBytes": 374505579818,
       "removable": false
+    },
+    {
+      "name": "Example Volume 1",
+      "mountPoint": "/Volumes/Example Volume 1",
+      "fileSystem": "apfs",
+      "totalBytes": 1102704640,
+      "availableBytes": 198529024,
+      "removable": true
+    },
+    {
+      "name": "Example Volume 2",
+      "mountPoint": "/Volumes/Example Volume 2",
+      "fileSystem": "apfs",
+      "totalBytes": 945049600,
+      "availableBytes": 182071296,
+      "removable": true
     }
   ],
   "network": [
     {
       "interface": "en0",
-      "rxBytesPerSec": 97046.49440025284,
-      "txBytesPerSec": 10842.333602803683,
-      "totalRxBytes": 23505731421,
-      "totalTxBytes": 6620039013
+      "rxBytesPerSec": 192635.03045978158,
+      "txBytesPerSec": 3165.1379543935714,
+      "totalRxBytes": 24872145064,
+      "totalTxBytes": 7139465493
     },
     {
       "interface": "llw0",
       "rxBytesPerSec": 0.0,
       "txBytesPerSec": 0.0,
-      "totalRxBytes": 4590523386,
-      "totalTxBytes": 146419816
+      "totalRxBytes": 4613343964,
+      "totalTxBytes": 149561328
     },
     {
       "interface": "lo0",
+      "rxBytesPerSec": 3635.6709282230863,
+      "txBytesPerSec": 3635.6709282230863,
+      "totalRxBytes": 450923473,
+      "totalTxBytes": 450923473
+    },
+    {
+      "interface": "awdl0",
       "rxBytesPerSec": 0.0,
       "txBytesPerSec": 0.0,
-      "totalRxBytes": 428138251,
-      "totalTxBytes": 428138251
+      "totalRxBytes": 57047337,
+      "totalTxBytes": 61625331
+    },
+    {
+      "interface": "utun4",
+      "rxBytesPerSec": 0.0,
+      "txBytesPerSec": 0.0,
+      "totalRxBytes": 898814,
+      "totalTxBytes": 787540
+    },
+    {
+      "interface": "utun5",
+      "rxBytesPerSec": 0.0,
+      "txBytesPerSec": 0.0,
+      "totalRxBytes": 0,
+      "totalTxBytes": 11227
+    },
+    {
+      "interface": "utun1",
+      "rxBytesPerSec": 0.0,
+      "txBytesPerSec": 0.0,
+      "totalRxBytes": 0,
+      "totalTxBytes": 11167
+    },
+    {
+      "interface": "utun2",
+      "rxBytesPerSec": 0.0,
+      "txBytesPerSec": 0.0,
+      "totalRxBytes": 0,
+      "totalTxBytes": 11107
+    },
+    {
+      "interface": "utun3",
+      "rxBytesPerSec": 0.0,
+      "txBytesPerSec": 0.0,
+      "totalRxBytes": 0,
+      "totalTxBytes": 11107
+    },
+    {
+      "interface": "utun0",
+      "rxBytesPerSec": 0.0,
+      "txBytesPerSec": 0.0,
+      "totalRxBytes": 0,
+      "totalTxBytes": 100
     }
   ],
   "processes": {
-    "total": 547,
-    "unreadable": 182,
+    "total": 607,
+    "system": 182,
+    "error": null,
     "topByCpu": [
       {
-        "pid": 72382,
+        "pid": 1,
         "name": "example-process-1",
-        "cpuPercent": 34.144005,
-        "memoryBytes": 393871360
+        "cpuPercent": 14.588648,
+        "memoryBytes": null
+      },
+      {
+        "pid": 43418,
+        "name": "example-process-2",
+        "cpuPercent": 13.566921,
+        "memoryBytes": 201852680
+      },
+      {
+        "pid": 72382,
+        "name": "example-process-3",
+        "cpuPercent": 10.310333,
+        "memoryBytes": 671548880
+      },
+      {
+        "pid": 160,
+        "name": "example-process-4",
+        "cpuPercent": 9.725765,
+        "memoryBytes": null
+      },
+      {
+        "pid": 195,
+        "name": "example-process-5",
+        "cpuPercent": 8.753189,
+        "memoryBytes": null
+      },
+      {
+        "pid": 172,
+        "name": "example-process-6",
+        "cpuPercent": 7.7806125,
+        "memoryBytes": null
       },
       {
         "pid": 1147,
-        "name": "example-process-2",
-        "cpuPercent": 6.7896357,
-        "memoryBytes": 136003584
+        "name": "example-process-7",
+        "cpuPercent": 6.568871,
+        "memoryBytes": 804996224
+      },
+      {
+        "pid": 66284,
+        "name": "example-process-8",
+        "cpuPercent": 5.1496444,
+        "memoryBytes": 491079744
+      },
+      {
+        "pid": 64023,
+        "name": "example-process-9",
+        "cpuPercent": 4.6512346,
+        "memoryBytes": 248940632
       },
       {
         "pid": 61418,
-        "name": "example-process-3",
-        "cpuPercent": 5.8834863,
-        "memoryBytes": 599736320
+        "name": "example-process-10",
+        "cpuPercent": 4.0135274,
+        "memoryBytes": 868937184
+      },
+      {
+        "pid": 100,
+        "name": "example-process-11",
+        "cpuPercent": 3.8903062,
+        "memoryBytes": null
+      },
+      {
+        "pid": 300,
+        "name": "example-process-12",
+        "cpuPercent": 2.9177296,
+        "memoryBytes": null
       }
     ],
     "topByMemory": [
       {
-        "pid": 66284,
-        "name": "example-process-4",
-        "cpuPercent": 4.865135,
-        "memoryBytes": 1009352704
+        "pid": 1930,
+        "name": "example-process-13",
+        "cpuPercent": 2.871478,
+        "memoryBytes": 3039253448
       },
       {
         "pid": 61418,
+        "name": "example-process-10",
+        "cpuPercent": 4.0135274,
+        "memoryBytes": 868937184
+      },
+      {
+        "pid": 1147,
+        "name": "example-process-7",
+        "cpuPercent": 6.568871,
+        "memoryBytes": 804996224
+      },
+      {
+        "pid": 72382,
         "name": "example-process-3",
-        "cpuPercent": 5.8834863,
-        "memoryBytes": 599736320
+        "cpuPercent": 10.310333,
+        "memoryBytes": 671548880
+      },
+      {
+        "pid": 748,
+        "name": "example-process-14",
+        "cpuPercent": 1.1188114,
+        "memoryBytes": 553306440
+      },
+      {
+        "pid": 66284,
+        "name": "example-process-8",
+        "cpuPercent": 5.1496444,
+        "memoryBytes": 491079744
+      },
+      {
+        "pid": 730,
+        "name": "example-process-15",
+        "cpuPercent": 1.6611952,
+        "memoryBytes": 487672808
+      },
+      {
+        "pid": 1210,
+        "name": "example-process-16",
+        "cpuPercent": 0.0,
+        "memoryBytes": 448203296
       },
       {
         "pid": 19885,
-        "name": "example-process-5",
-        "cpuPercent": 3.2732835,
-        "memoryBytes": 483835904
+        "name": "example-process-17",
+        "cpuPercent": 2.8025396,
+        "memoryBytes": 432899488
+      },
+      {
+        "pid": 67074,
+        "name": "example-process-18",
+        "cpuPercent": 0.011257455,
+        "memoryBytes": 418712120
+      },
+      {
+        "pid": 20574,
+        "name": "example-process-19",
+        "cpuPercent": 0.0,
+        "memoryBytes": 399149168
+      },
+      {
+        "pid": 10767,
+        "name": "example-process-20",
+        "cpuPercent": 0.0020570157,
+        "memoryBytes": 394053744
       }
     ]
   }

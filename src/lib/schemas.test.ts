@@ -44,6 +44,15 @@ describe("SystemSnapshotSchema", () => {
     expect(SystemSnapshotSchema.safeParse(s).success).toBe(true);
   });
 
+  it("accepts a snapshot whose process list or memory breakdown could not be read", () => {
+    const s = {
+      ...clone(snapshot),
+      processes: { total: 0, system: 0, error: "/bin/ps did not finish within 5 s", topByCpu: [], topByMemory: [] },
+    };
+    s.memory.breakdown = null as unknown as typeof s.memory.breakdown;
+    expect(SystemSnapshotSchema.safeParse(s).success).toBe(true);
+  });
+
   it("rejects impossible values instead of displaying them", () => {
     const over = clone(snapshot);
     over.memory.usedBytes = over.memory.totalBytes + 1;
@@ -53,9 +62,10 @@ describe("SystemSnapshotSchema", () => {
     negative.cpu.usagePercent = -3;
     expect(SystemSnapshotSchema.safeParse(negative).success).toBe(false);
 
-    const unreadable = clone(snapshot);
-    unreadable.processes.unreadable = unreadable.processes.total + 1;
-    expect(SystemSnapshotSchema.safeParse(unreadable).success).toBe(false);
+    const system = clone(snapshot);
+    system.processes.system = system.processes.total + 1;
+    expect(SystemSnapshotSchema.safeParse(system).success).toBe(false);
+
 
     const missing = clone(snapshot) as Record<string, unknown>;
     delete missing.memory;

@@ -6,14 +6,13 @@ pub mod ioreg;
 pub mod pmset;
 pub mod profiler;
 
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 pub use pmset::ChargeState;
+
+use crate::tool::run;
 
 const PMSET: &str = "/usr/bin/pmset";
 const IOREG: &str = "/usr/sbin/ioreg";
@@ -24,7 +23,6 @@ const SYSTEM_PROFILER: &str = "/usr/sbin/system_profiler";
 const PROFILER_TTL: Duration = Duration::from_secs(15 * 60);
 const GAUGE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROFILER_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -156,57 +154,6 @@ fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
 
-/// Runs a fixed system tool (absolute path, constant arguments, no shell) with a
-/// time limit on both its output and its exit, so a hung tool cannot hold the
-/// battery lock or the sampler thread. A tool that overruns is killed.
-fn run(program: &str, args: &[&str], timeout: Duration) -> Result<String, String> {
-    let deadline = Instant::now() + timeout;
-    let mut child = Command::new(program)
-        .args(args)
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("could not run {program}: {e}"))?;
-
-    // Read on another thread so a full pipe cannot stall the child. The channel
-    // bounds the wait even if something keeps the pipe open.
-    let stdout = child.stdout.take().ok_or("stdout was not captured")?;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = tx.send(stdout.take(MAX_OUTPUT_BYTES).read_to_end(&mut buf).map(|_| buf));
-    });
-    let overran = || format!("{program} did not finish within {} s", timeout.as_secs());
-
-    let out = match rx.recv_timeout(timeout) {
-        Ok(read) => read.map_err(|e| format!("{program}: {e}")),
-        Err(_) => Err(overran()),
-    };
-    // Tools exit as soon as they close stdout, so this normally returns at once.
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) if out.is_ok() => break status,
-            Ok(None) if out.is_ok() && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            Ok(None) if out.is_ok() => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(overran());
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(out.err().unwrap_or_else(overran));
-            }
-        }
-    };
-    let out = out?;
-    if !status.success() {
-        return Err(format!("{program} exited with {status}"));
-    }
-    Ok(String::from_utf8_lossy(&out).into_owned())
-}
 
 #[derive(Default)]
 pub struct BatteryReader {
@@ -282,30 +229,6 @@ mod tests {
         assert_eq!(b.raw_capacity_percent, None);
         assert_eq!(b.power_w, None);
         assert_eq!(b.notes.len(), 4);
-    }
-
-    #[test]
-    fn run_returns_output_and_reports_failures() {
-        assert_eq!(run("/bin/echo", &["ok"], GAUGE_TIMEOUT).unwrap(), "ok\n");
-        assert!(run("/usr/bin/false", &[], GAUGE_TIMEOUT).unwrap_err().contains("exited"));
-        assert!(run("/nonexistent/tool", &[], GAUGE_TIMEOUT).unwrap_err().contains("could not run"));
-    }
-
-    #[test]
-    fn run_is_bounded_when_a_descendant_keeps_the_pipe_open() {
-        // The shell exits at once but leaves a background sleep holding stdout.
-        let started = Instant::now();
-        let err = run("/bin/sh", &["-c", "/bin/sleep 30 & echo started"], Duration::from_millis(400)).unwrap_err();
-        assert!(err.contains("did not finish"), "{err}");
-        assert!(started.elapsed() < Duration::from_secs(5));
-    }
-
-    #[test]
-    fn run_kills_a_hung_command() {
-        let started = Instant::now();
-        let err = run("/bin/sleep", &["30"], Duration::from_millis(300)).unwrap_err();
-        assert!(err.contains("did not finish"), "{err}");
-        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     /// Every prefix of real output (a truncated read) and pseudo-random bytes

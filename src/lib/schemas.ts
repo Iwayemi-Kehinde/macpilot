@@ -21,7 +21,8 @@ export const ProcessSchema = z.object({
   pid: z.number().int().nonnegative(),
   name: z.string(),
   cpuPercent: finite.nonnegative().nullable(),
-  memoryBytes: bytes,
+  /** Physical footprint; null for system processes, whose memory macOS hides from apps. */
+  memoryBytes: bytes.nullable(),
 });
 
 export const SystemSnapshotSchema = z.object({
@@ -37,7 +38,14 @@ export const SystemSnapshotSchema = z.object({
     .object({
       totalBytes: bytes.positive(),
       usedBytes: bytes,
-      freeBytes: bytes,
+      breakdown: z
+        .object({
+          appBytes: bytes,
+          wiredBytes: bytes,
+          compressedBytes: bytes,
+          cachedFilesBytes: bytes,
+        })
+        .nullable(),
       swapTotalBytes: bytes,
       swapUsedBytes: bytes,
     })
@@ -67,11 +75,14 @@ export const SystemSnapshotSchema = z.object({
   processes: z
     .object({
       total: z.number().int().nonnegative(),
-      unreadable: z.number().int().nonnegative(),
+      system: z.number().int().nonnegative(),
+      /** Why there is no process list, if ps failed. */
+      error: z.string().nullable(),
       topByCpu: z.array(ProcessSchema),
       topByMemory: z.array(ProcessSchema),
     })
-    .refine((p) => p.unreadable <= p.total, "more unreadable processes than processes"),
+    .refine((p) => p.system <= p.total, "more system processes than processes")
+    .refine((p) => p.topByMemory.every((q) => q.memoryBytes !== null), "memory ranking includes a process without memory"),
 });
 
 export const ChargeStateSchema = z.enum([
