@@ -7,82 +7,55 @@ const finite = z.number().finite();
 // Float rounding can put a fully busy core a hair over 100.
 const percent = finite.min(0).max(100.5);
 const rate = finite.nonnegative();
+const watts = finite.min(-1000).max(1000);
 
-export const HostInfoSchema = z.object({
-  hostname: z.string().nullable(),
-  osVersion: z.string().nullable(),
-  kernelVersion: z.string().nullable(),
-  cpuBrand: z.string().nullable(),
-  physicalCores: z.number().int().positive().nullable(),
-  logicalCores: z.number().int().positive(),
-});
-
-export const ProcessSchema = z.object({
-  pid: z.number().int().nonnegative(),
+export const AppUsageSchema = z.object({
   name: z.string(),
-  cpuPercent: finite.nonnegative().nullable(),
-  /** Physical footprint; null for system processes, whose memory macOS hides from apps. */
+  processCount: z.number().int().positive(),
+  /** Processes of this user: macOS reports memory and power only for these. */
+  ownProcessCount: z.number().int().nonnegative(),
+  /** Percent of one core, summed over the app's processes. */
+  cpuPercent: rate.nullable(),
+  powerW: rate.nullable(),
   memoryBytes: bytes.nullable(),
 });
 
 export const SystemSnapshotSchema = z.object({
   timestampMs: z.number().int().nonnegative(),
   uptimeSecs: z.number().int().nonnegative(),
-  host: HostInfoSchema,
+  host: z.object({
+    hostname: z.string().nullable(),
+    osVersion: z.string().nullable(),
+    cpuBrand: z.string().nullable(),
+    logicalCores: z.number().int().positive(),
+  }),
   cpu: z.object({
     usagePercent: percent.nullable(),
-    perCorePercent: z.array(percent),
-    loadAverage: z.tuple([rate, rate, rate]),
+    thermal: z.enum(["nominal", "moderate", "heavy", "trapping", "sleeping"]).nullable(),
   }),
   memory: z
     .object({
       totalBytes: bytes.positive(),
       usedBytes: bytes,
-      breakdown: z
-        .object({
-          appBytes: bytes,
-          wiredBytes: bytes,
-          compressedBytes: bytes,
-          cachedFilesBytes: bytes,
-        })
-        .nullable(),
+      pressure: z.enum(["normal", "warning", "critical"]).nullable(),
       swapTotalBytes: bytes,
       swapUsedBytes: bytes,
     })
     .refine((m) => m.usedBytes <= m.totalBytes, "used memory exceeds total")
     .refine((m) => m.swapUsedBytes <= m.swapTotalBytes, "used swap exceeds total"),
-  disks: z.array(
-    z
-      .object({
-        name: z.string(),
-        mountPoint: z.string(),
-        fileSystem: z.string(),
-        totalBytes: bytes,
-        availableBytes: bytes,
-        removable: z.boolean(),
-      })
-      .refine((d) => d.availableBytes <= d.totalBytes, "disk free space exceeds capacity"),
-  ),
-  network: z.array(
-    z.object({
-      interface: z.string(),
-      rxBytesPerSec: rate.nullable(),
-      txBytesPerSec: rate.nullable(),
-      totalRxBytes: bytes,
-      totalTxBytes: bytes,
-    }),
-  ),
-  processes: z
+  disk: z
+    .object({ name: z.string(), totalBytes: bytes, availableBytes: bytes })
+    .refine((d) => d.availableBytes <= d.totalBytes, "disk free space exceeds capacity")
+    .nullable(),
+  network: z.object({ rxBytesPerSec: rate.nullable(), txBytesPerSec: rate.nullable() }),
+  apps: z
     .object({
-      total: z.number().int().nonnegative(),
-      system: z.number().int().nonnegative(),
-      /** Why there is no process list, if ps failed. */
+      totalProcesses: z.number().int().nonnegative(),
+      systemProcesses: z.number().int().nonnegative(),
       error: z.string().nullable(),
-      topByCpu: z.array(ProcessSchema),
-      topByMemory: z.array(ProcessSchema),
+      apps: z.array(AppUsageSchema.refine((a) => a.ownProcessCount <= a.processCount, "more own processes than processes")),
     })
-    .refine((p) => p.system <= p.total, "more system processes than processes")
-    .refine((p) => p.topByMemory.every((q) => q.memoryBytes !== null), "memory ranking includes a process without memory"),
+    .refine((a) => a.systemProcesses <= a.totalProcesses, "more system processes than processes"),
 });
 
 export const ChargeStateSchema = z.enum([
@@ -97,23 +70,24 @@ export const ChargeStateSchema = z.enum([
 export const BatteryInfoSchema = z
   .object({
     present: z.boolean(),
-    powerSource: z.string().nullable(),
     percent: z.number().int().min(0).max(100).nullable(),
     state: ChargeStateSchema,
     externalPower: z.boolean().nullable(),
     timeRemainingMin: z.number().int().nonnegative().nullable(),
     timeRemainingKind: z.enum(["untilEmpty", "untilFull"]).nullable(),
     cycleCount: z.number().int().nonnegative().nullable(),
-    designCapacityMah: z.number().int().positive().nullable(),
-    fullChargeCapacityMah: z.number().int().positive().nullable(),
-    currentChargeMah: z.number().int().nonnegative().nullable(),
-    rawCapacityPercent: finite.min(0).max(200).nullable(),
     appleMaxCapacityPercent: z.number().int().min(0).max(100).nullable(),
     condition: z.string().nullable(),
-    voltageMv: z.number().int().positive().nullable(),
-    amperageMa: z.number().int().nullable(),
-    powerW: finite.nullable(),
     temperatureC: finite.min(-20).max(100).nullable(),
+    /** What the whole Mac draws, screen included. */
+    systemPowerW: watts.min(0).nullable(),
+    adapterPowerW: watts.min(0).nullable(),
+    /** Into the battery while positive, out of it while negative. */
+    batteryPowerW: watts.nullable(),
+    adapterRatingW: z.number().int().positive().nullable(),
+    /** On battery: the gauge's present current as points of the shown percentage per hour. */
+    drainPercentPerHour: rate.nullable(),
+    drainCalibrated: z.boolean(),
     notes: z.array(z.string()),
   })
   .refine(
@@ -126,10 +100,6 @@ export const BatterySampleSchema = z.object({
   percent: z.number().int().min(0).max(100),
   charging: z.boolean(),
   externalPower: z.boolean(),
-  chargeMah: z.number().int().nonnegative().nullable(),
-  fullChargeMah: z.number().int().positive().nullable(),
-  amperageMa: z.number().int().nullable(),
-  voltageMv: z.number().int().positive().nullable(),
 });
 
 export const DischargeEstimateSchema = z.object({
@@ -145,8 +115,10 @@ export const DischargeEstimateSchema = z.object({
 export const BatteryHistorySchema = z
   .object({
     samples: z.array(BatterySampleSchema),
-    discharge: DischargeEstimateSchema.nullable(),
-    dischargeUnavailableReason: z.string().nullable(),
+    /** The drain averaged over the current run on battery. */
+    average: DischargeEstimateSchema.nullable(),
+    averageUnavailableReason: z.string().nullable(),
+    usual: z.object({ percentPerHour: rate, hours: rate }).nullable(),
     sampleIntervalSecs: z.number().int().positive(),
     maxGapSecs: z.number().int().positive(),
     persistent: z.boolean(),
@@ -156,10 +128,35 @@ export const BatteryHistorySchema = z
     "battery samples are out of order",
   );
 
+export const SleepBlockerSchema = z.object({
+  pid: z.number().int().nonnegative(),
+  process: z.string(),
+  forPid: z.number().int().nonnegative().nullable(),
+  app: z.string(),
+  keeps: z.enum(["display", "system"]),
+  reason: z.string(),
+  heldSecs: z.number().int().nonnegative().nullable(),
+  endsInSecs: z.number().int().nonnegative().nullable(),
+});
+
+export const ListenerSchema = z.object({
+  port: z.number().int().min(0).max(65535),
+  pid: z.number().int().nonnegative(),
+  process: z.string(),
+  app: z.string(),
+  addresses: z.array(z.string()).min(1),
+  /** Reachable from other devices on the network. */
+  network: z.boolean(),
+  folder: z.string().nullable(),
+  path: z.string().nullable(),
+});
+
 export type SystemSnapshot = z.infer<typeof SystemSnapshotSchema>;
-export type ProcessInfo = z.infer<typeof ProcessSchema>;
+export type AppUsage = z.infer<typeof AppUsageSchema>;
 export type ChargeState = z.infer<typeof ChargeStateSchema>;
 export type BatteryInfo = z.infer<typeof BatteryInfoSchema>;
 export type BatterySample = z.infer<typeof BatterySampleSchema>;
 export type DischargeEstimate = z.infer<typeof DischargeEstimateSchema>;
 export type BatteryHistory = z.infer<typeof BatteryHistorySchema>;
+export type SleepBlocker = z.infer<typeof SleepBlockerSchema>;
+export type Listener = z.infer<typeof ListenerSchema>;

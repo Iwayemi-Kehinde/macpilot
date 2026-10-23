@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_ERROR_BYTES: u64 = 4096;
 
 /// Runs a fixed system tool (absolute path, constant arguments, no shell) with a
 /// time limit on both its output and its exit, so a hung tool cannot hold a
@@ -23,7 +24,7 @@ pub fn run_timed(program: &str, args: &[&str], timeout: Duration) -> Result<(Str
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not run {program}: {e}"))?;
 
@@ -35,6 +36,15 @@ pub fn run_timed(program: &str, args: &[&str], timeout: Duration) -> Result<(Str
         let mut buf = Vec::new();
         let read = stdout.take(MAX_OUTPUT_BYTES).read_to_end(&mut buf).map(|_| buf);
         let _ = tx.send((read, Instant::now()));
+    });
+    let mut stderr = child.stderr.take().ok_or("stderr was not captured")?;
+    let (etx, erx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut stderr).take(MAX_ERROR_BYTES).read_to_end(&mut buf);
+        // Drain the rest so a chatty tool cannot block on a full pipe.
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        let _ = etx.send(buf);
     });
     let overran = || format!("{program} did not finish within {} s", timeout.as_secs());
 
@@ -61,7 +71,13 @@ pub fn run_timed(program: &str, args: &[&str], timeout: Duration) -> Result<(Str
     };
     let out = out?;
     if !status.success() {
-        return Err(format!("{program} exited with {status}"));
+        // The tool has exited, so its stderr is closed unless a descendant still holds it.
+        let said = erx.recv_timeout(Duration::from_millis(200)).unwrap_or_default();
+        let said = String::from_utf8_lossy(&said);
+        return Err(match said.lines().next().map(str::trim).filter(|l| !l.is_empty()) {
+            Some(line) => format!("{program} exited with {status}: {line}"),
+            None => format!("{program} exited with {status}"),
+        });
     }
     Ok((String::from_utf8_lossy(&out).into_owned(), ended))
 }
@@ -75,7 +91,9 @@ mod tests {
     #[test]
     fn run_returns_output_and_reports_failures() {
         assert_eq!(run("/bin/echo", &["ok"], TIMEOUT).unwrap(), "ok\n");
-        assert!(run("/usr/bin/false", &[], TIMEOUT).unwrap_err().contains("exited"));
+        assert_eq!(run("/usr/bin/false", &[], TIMEOUT).unwrap_err(), "/usr/bin/false exited with exit status: 1");
+        let err = run("/bin/ls", &["/nonexistent-macpilot"], TIMEOUT).unwrap_err();
+        assert!(err.ends_with("No such file or directory"), "{err}");
         assert!(run("/nonexistent/tool", &[], TIMEOUT).unwrap_err().contains("could not run"));
     }
 

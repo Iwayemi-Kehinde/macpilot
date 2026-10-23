@@ -1,11 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { z } from "zod";
+import { z } from "zod";
 import {
   BatteryHistorySchema,
   BatteryInfoSchema,
+  ListenerSchema,
+  SleepBlockerSchema,
   SystemSnapshotSchema,
   type BatteryHistory,
   type BatteryInfo,
+  type Listener,
+  type SleepBlocker,
   type SystemSnapshot,
 } from "./schemas";
 
@@ -37,3 +41,8 @@ export const getBattery = (): Promise<BatteryInfo> => call("get_battery", Batter
 
 export const getBatteryHistory = (hours: number): Promise<BatteryHistory> =>
   call("get_battery_history", BatteryHistorySchema, { hours });
+
+export const getSleepBlockers = (): Promise<SleepBlocker[]> =>
+  call("get_sleep_blockers", z.array(SleepBlockerSchema));
+
+export const getPorts = (): Promise<Listener[]> => call("get_ports", z.array(ListenerSchema));

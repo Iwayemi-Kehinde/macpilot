@@ -1,7 +1,10 @@
+mod apps;
+mod awake;
 mod battery;
 mod history;
 mod macos;
 mod metrics;
+mod ports;
 mod processes;
 mod tool;
 
@@ -11,9 +14,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tauri::{Manager, State};
 
+use awake::Blocker;
 use battery::{profiler::ProfilerBattery, BatteryInfo, BatteryReader, ChargeState};
-use history::{BatterySample, DischargeEstimate, History};
+use history::{BatterySample, DischargeEstimate, History, UsualDrain};
 use metrics::{Monitor, SystemSnapshot};
+use ports::Listener;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 const RETENTION_SECS: i64 = 30 * 24 * 3600;
@@ -33,8 +38,10 @@ struct AppState {
 #[serde(rename_all = "camelCase")]
 struct BatteryHistory {
     samples: Vec<BatterySample>,
-    discharge: Option<DischargeEstimate>,
-    discharge_unavailable_reason: Option<String>,
+    /// The drain averaged over the current run on battery.
+    average: Option<DischargeEstimate>,
+    average_unavailable_reason: Option<String>,
+    usual: Option<UsualDrain>,
     sample_interval_secs: u64,
     max_gap_secs: i64,
     persistent: bool,
@@ -61,13 +68,23 @@ async fn get_system_snapshot(state: State<'_, AppState>) -> Result<SystemSnapsho
 async fn get_battery(state: State<'_, AppState>) -> Result<BatteryInfo, String> {
     let (reader, history, last) = (state.battery.clone(), state.history.clone(), state.last_external_power.clone());
     blocking(move || {
-        let info = reader.lock().map_err(|_| "battery lock poisoned")?.read()?;
+        let mut info = reader.lock().map_err(|_| "battery lock poisoned")?.read()?;
         // Recorded now rather than at the sampler's next minute, so history and
         // the drain rate follow the adapter being connected or removed at once.
         let changed = last.lock().is_ok_and(|mut last| adapter_changed(&mut last, info.external_power));
+        let Ok(mut h) = history.lock() else { return Ok(info) };
         if changed {
-            if let (Some(sample), Ok(h)) = (sample_from(&info), history.lock()) {
+            if let Some(sample) = sample_from(&info) {
                 store(&h, &sample);
+            }
+        }
+        if let (Some(false), Some(ma), Some(full)) = (info.external_power, info.amperage_ma.filter(|a| *a < 0), info.full_charge_capacity_mah) {
+            match h.scale(now_secs()) {
+                Ok(scale) => {
+                    info.drain_percent_per_hour = Some((scale.percent_per_hour(-ma as f64, full) * 100.0).round() / 100.0);
+                    info.drain_calibrated = scale.is_fitted();
+                }
+                Err(e) => eprintln!("battery calibration unavailable: {e}"),
             }
         }
         Ok(info)
@@ -81,7 +98,7 @@ async fn get_battery_history(hours: u32, state: State<'_, AppState>) -> Result<B
         return Err(format!("hours must be between 1 and {MAX_HISTORY_HOURS}"));
     }
     let history = state.history.clone();
-    let (samples, estimate) = blocking(move || {
+    let drain = blocking(move || {
         history
             .lock()
             .map_err(|_| "history lock poisoned")?
@@ -89,18 +106,29 @@ async fn get_battery_history(hours: u32, state: State<'_, AppState>) -> Result<B
             .map_err(|e| format!("could not read battery history: {e}"))
     })
     .await?;
-    let (discharge, discharge_unavailable_reason) = match estimate {
+    let (average, average_unavailable_reason) = match drain.estimate {
         Ok(e) => (Some(e), None),
         Err(reason) => (None, Some(reason)),
     };
     Ok(BatteryHistory {
-        samples,
-        discharge,
-        discharge_unavailable_reason,
+        samples: drain.samples,
+        average,
+        average_unavailable_reason,
+        usual: drain.usual,
         sample_interval_secs: SAMPLE_INTERVAL.as_secs(),
         max_gap_secs: history::MAX_SAMPLE_GAP_SECS,
         persistent: state.history_persistent,
     })
+}
+
+#[tauri::command]
+async fn get_sleep_blockers() -> Result<Vec<Blocker>, String> {
+    blocking(awake::read).await
+}
+
+#[tauri::command]
+async fn get_ports() -> Result<Vec<Listener>, String> {
+    blocking(ports::read).await
 }
 
 /// True when the adapter state differs from the previous known one, which is then updated.
@@ -194,7 +222,13 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_system_snapshot, get_battery, get_battery_history])
+        .invoke_handler(tauri::generate_handler![
+            get_system_snapshot,
+            get_battery,
+            get_battery_history,
+            get_sleep_blockers,
+            get_ports
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

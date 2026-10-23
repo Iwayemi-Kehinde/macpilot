@@ -1,11 +1,11 @@
-//! Every running process, with CPU rates from the change in accumulated CPU
-//! time between two reads.
+//! Every running process, with CPU and power rates from the change in
+//! accumulated CPU time and energy between two reads.
 //!
 //! `ps` may read the CPU time of every user's processes, so it supplies the
 //! list and each process's owner. This user's own processes are then re-read
-//! from the kernel, which gives an exact CPU time and the footprint. sysinfo's
-//! per-process rate is not used: it keeps a process's last busy value once
-//! the process goes idle.
+//! from the kernel, which gives an exact CPU time, the energy it has
+//! accounted to them and the footprint. sysinfo's per-process rate is not
+//! used: it keeps a process's last busy value once the process goes idle.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -21,12 +21,17 @@ pub struct Sample {
     pub pid: u32,
     pub uid: u32,
     pub name: String,
+    /// The executable, when macOS still has it at its path.
+    pub path: Option<String>,
     /// Accumulated CPU time, read at `at`.
     pub cpu_secs: f64,
     pub at: Instant,
     /// Physical footprint; `None` for processes of macOS and other users,
     /// whose memory macOS shows only to administrator tools.
     pub footprint_bytes: Option<u64>,
+    /// Accumulated CPU energy in nanojoules, read at `at`; `None` where the
+    /// footprint is.
+    pub energy_nj: Option<u64>,
 }
 
 /// Lists every process but zombies, as `top` does.
@@ -40,12 +45,13 @@ pub fn read(kernel: &Kernel) -> Result<Vec<Sample>, String> {
     Ok(parse(&output)
         .filter_map(|(pid, uid, cpu_secs)| {
             // No name: a zombie, or a process that ended after ps listed it.
-            let name = macos::process_name(pid)?;
-            let mut sample = Sample { pid, uid, name, cpu_secs, at: ps_at, footprint_bytes: None };
+            let (name, path) = macos::process_identity(pid)?;
+            let mut sample = Sample { pid, uid, name, path, cpu_secs, at: ps_at, footprint_bytes: None, energy_nj: None };
             if uid == me {
                 // One of this user's processes without a reading is ending.
                 let usage = kernel.usage(pid)?;
                 sample.footprint_bytes = Some(usage.footprint_bytes);
+                sample.energy_nj = usage.energy_nj;
                 if let Some(cpu_secs) = usage.cpu_secs {
                     (sample.cpu_secs, sample.at) = (cpu_secs, Instant::now());
                 }
@@ -90,15 +96,25 @@ struct Previous {
     uid: u32,
     name: String,
     cpu_secs: f64,
+    energy_nj: Option<u64>,
     at: Instant,
 }
 
-pub struct CpuRates {
+/// One process's use since the previous reading.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Rate {
+    /// Percent of one core.
+    pub cpu_percent: Option<f32>,
+    /// Average CPU power in watts, for this user's processes.
+    pub power_w: Option<f32>,
+}
+
+pub struct Rates {
     last: HashMap<u32, Previous>,
     max_window: Duration,
 }
 
-impl CpuRates {
+impl Rates {
     /// Rates averaged over more than `max_window` describe the past, not now.
     pub fn new(max_window: Duration) -> Self {
         Self { last: HashMap::new(), max_window }
@@ -110,24 +126,39 @@ impl CpuRates {
         self.last.clear();
     }
 
-    /// Each sample's CPU use since the previous update, as a percent of one
-    /// core. `None` for a process not seen then (new, or its pid reused), or
-    /// one whose previous reading is older than `max_window`.
-    pub fn update(&mut self, samples: &[Sample]) -> Vec<Option<f32>> {
+    /// Each sample's use since the previous update. No rate for a process not
+    /// seen then (new, or its pid reused), or one whose previous reading is
+    /// older than `max_window`.
+    pub fn update(&mut self, samples: &[Sample]) -> Vec<Rate> {
         let rates = samples
             .iter()
             .map(|s| {
-                let prev = self.last.get(&s.pid)?;
-                let window = s.at.checked_duration_since(prev.at).filter(|w| !w.is_zero() && *w <= self.max_window)?;
+                let Some(prev) = self.last.get(&s.pid) else { return Rate::default() };
+                let Some(window) = s.at.checked_duration_since(prev.at).filter(|w| !w.is_zero() && *w <= self.max_window) else {
+                    return Rate::default();
+                };
                 // A pid with a new owner or name is a new process. A new owner
                 // also means its CPU time now comes from the other source.
-                (prev.uid == s.uid && prev.name == s.name && prev.cpu_secs <= s.cpu_secs)
-                    .then(|| ((s.cpu_secs - prev.cpu_secs) / window.as_secs_f64() * 100.0) as f32)
+                if prev.uid != s.uid || prev.name != s.name {
+                    return Rate::default();
+                }
+                let secs = window.as_secs_f64();
+                Rate {
+                    cpu_percent: (prev.cpu_secs <= s.cpu_secs).then(|| ((s.cpu_secs - prev.cpu_secs) / secs * 100.0) as f32),
+                    power_w: prev
+                        .energy_nj
+                        .zip(s.energy_nj)
+                        .filter(|(before, now)| before <= now)
+                        .map(|(before, now)| ((now - before) as f64 / 1e9 / secs) as f32),
+                }
             })
             .collect();
         self.last = samples
             .iter()
-            .map(|s| (s.pid, Previous { uid: s.uid, name: s.name.clone(), cpu_secs: s.cpu_secs, at: s.at }))
+            .map(|s| {
+                let prev = Previous { uid: s.uid, name: s.name.clone(), cpu_secs: s.cpu_secs, energy_nj: s.energy_nj, at: s.at };
+                (s.pid, prev)
+            })
             .collect();
         rates
     }
@@ -156,23 +187,39 @@ mod tests {
     }
 
     fn sample(pid: u32, uid: u32, name: &str, cpu_secs: f64, at: Instant) -> Sample {
-        Sample { pid, uid, name: name.into(), cpu_secs, at, footprint_bytes: None }
+        Sample { pid, uid, name: name.into(), path: None, cpu_secs, at, footprint_bytes: None, energy_nj: None }
+    }
+
+    fn cpu(rates: Vec<Rate>) -> Vec<Option<f32>> {
+        rates.into_iter().map(|r| r.cpu_percent).collect()
     }
 
     #[test]
     fn a_process_that_goes_idle_drops_to_zero() {
-        let mut rates = CpuRates::new(Duration::from_secs(15));
+        let mut rates = Rates::new(Duration::from_secs(15));
         let (t0, ms) = (Instant::now(), Duration::from_millis);
-        assert_eq!(rates.update(&[sample(7, 501, "worker", 1.0, t0)]), [None]);
-        assert_eq!(rates.update(&[sample(7, 501, "worker", 1.05, t0 + ms(100))]), [Some(50.0)]);
-        assert_eq!(rates.update(&[sample(7, 501, "worker", 1.05, t0 + ms(200))]), [Some(0.0)]);
+        assert_eq!(cpu(rates.update(&[sample(7, 501, "worker", 1.0, t0)])), [None]);
+        assert_eq!(cpu(rates.update(&[sample(7, 501, "worker", 1.05, t0 + ms(100))])), [Some(50.0)]);
+        assert_eq!(cpu(rates.update(&[sample(7, 501, "worker", 1.05, t0 + ms(200))])), [Some(0.0)]);
         rates.reset();
-        assert_eq!(rates.update(&[sample(7, 501, "worker", 1.05, t0 + ms(300))]), [None]);
+        assert_eq!(cpu(rates.update(&[sample(7, 501, "worker", 1.05, t0 + ms(300))])), [None]);
+    }
+
+    #[test]
+    fn power_is_energy_over_the_window_for_own_processes() {
+        let mut rates = Rates::new(Duration::from_secs(15));
+        let (t0, ms) = (Instant::now(), Duration::from_millis);
+        let with_energy = |nj, at| Sample { energy_nj: Some(nj), ..sample(7, 501, "worker", 1.0, at) };
+        rates.update(&[with_energy(1_000_000_000, t0), sample(8, 0, "daemon", 1.0, t0)]);
+        let next = rates.update(&[with_energy(1_900_000_000, t0 + ms(500)), sample(8, 0, "daemon", 1.1, t0 + ms(500))]);
+        assert_eq!(next[0].power_w, Some(1.8));
+        // Other users' processes have no energy reading.
+        assert_eq!(next[1], Rate { cpu_percent: Some(20.0), power_w: None });
     }
 
     #[test]
     fn no_rate_for_a_changed_process_or_an_unfit_window() {
-        let mut rates = CpuRates::new(Duration::from_secs(15));
+        let mut rates = Rates::new(Duration::from_secs(15));
         let (t0, secs) = (Instant::now(), Duration::from_secs);
         rates.update(&[sample(7, 0, "worker", 5.0, t0), sample(8, 0, "daemon", 5.0, t0), sample(9, 0, "daemon", 1.0, t0)]);
         let next = [
@@ -185,30 +232,32 @@ mod tests {
             // Previous reading too old to describe now.
             sample(9, 0, "daemon", 1.2, t0 + secs(20)),
         ];
-        assert_eq!(rates.update(&next), [None, None, None, None]);
+        assert_eq!(cpu(rates.update(&next)), [None, None, None, None]);
         // Same instant as the previous reading.
-        assert_eq!(rates.update(&[sample(9, 0, "daemon", 1.3, t0 + secs(20))]), [None]);
+        assert_eq!(cpu(rates.update(&[sample(9, 0, "daemon", 1.3, t0 + secs(20))])), [None]);
     }
 
     #[test]
     fn live_read_covers_every_user() {
         let kernel = Kernel::new();
         let me = unsafe { libc::getuid() };
-        let mut rates = CpuRates::new(Duration::from_secs(15));
+        let mut rates = Rates::new(Duration::from_secs(15));
         let first = read(&kernel).unwrap();
-        assert!(rates.update(&first).iter().all(Option::is_none));
+        assert!(rates.update(&first).iter().all(|r| *r == Rate::default()));
         // launchd belongs to root: listed by ps, named by the kernel, its memory hidden.
         assert!(first.iter().any(|s| s.pid == 1 && s.uid == 0 && s.name == "launchd" && s.footprint_bytes.is_none()));
         assert!(first.iter().any(|s| s.pid == std::process::id() && s.uid == me && s.footprint_bytes.is_some()));
         // Memory is readable for exactly this user's processes.
         assert!(first.iter().all(|s| (s.uid == me) == s.footprint_bytes.is_some()));
+        assert!(first.iter().all(|s| (s.uid == me) == s.energy_nj.is_some()));
         std::thread::sleep(Duration::from_millis(300));
         let second = read(&kernel).unwrap();
         let rates = rates.update(&second);
-        assert!(rates.iter().flatten().all(|r| *r >= 0.0));
-        let rate_of = |pid| second.iter().zip(&rates).find(|(s, _)| s.pid == pid).and_then(|(_, r)| *r);
-        // Timed by the kernel and by ps respectively.
-        assert!(rate_of(std::process::id()).is_some() && rate_of(1).is_some());
+        assert!(rates.iter().filter_map(|r| r.cpu_percent).all(|r| r >= 0.0));
+        let rate_of = |pid| second.iter().zip(&rates).find(|(s, _)| s.pid == pid).map(|(_, r)| *r).unwrap();
+        // Timed by the kernel and by ps respectively; power only for our own.
+        assert!(rate_of(std::process::id()).cpu_percent.is_some() && rate_of(std::process::id()).power_w.is_some());
+        assert!(rate_of(1).cpu_percent.is_some() && rate_of(1).power_w.is_none());
     }
 
     /// Catches a wrong tick length: rusage times are not nanoseconds on Apple Silicon.

@@ -11,8 +11,13 @@ use serde::Serialize;
 /// was likely asleep or MacPilot was closed), so no rate spans the gap.
 pub const MAX_SAMPLE_GAP_SECS: i64 = 15 * 60;
 /// How far back the drain estimate reads, whatever range the chart shows. A
-/// run on battery is shorter than this; earlier runs calibrate the percentage.
+/// run on battery is shorter than this; earlier runs calibrate the percentage
+/// and give the usual drain.
 const ESTIMATE_LOOKBACK_SECS: i64 = 7 * 24 * 3600;
+/// The calibration changes slowly, so it is refitted this often.
+const SCALE_REFIT_SECS: i64 = 10 * 60;
+/// Less time than this on battery says little about the usual drain.
+const MIN_USUAL_SECS: i64 = 2 * 3600;
 const MIN_WINDOW_SECS: i64 = 10 * 60;
 const MIN_SAMPLES: usize = 3;
 /// Whole-number readings at fewer different percentages than this fit too rough a line.
@@ -30,10 +35,14 @@ pub struct BatterySample {
     pub percent: u8,
     pub charging: bool,
     pub external_power: bool,
+    #[serde(skip)]
     pub charge_mah: Option<u32>,
     /// The gauge's full-charge capacity when the sample was taken.
+    #[serde(skip)]
     pub full_charge_mah: Option<u32>,
+    #[serde(skip)]
     pub amperage_ma: Option<i64>,
+    #[serde(skip)]
     pub voltage_mv: Option<u32>,
 }
 
@@ -58,8 +67,18 @@ pub struct DischargeEstimate {
     pub confidence_reason: String,
 }
 
+/// The drain while MacPilot ran on battery over the last week.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsualDrain {
+    pub percent_per_hour: f64,
+    pub hours: f64,
+}
+
 pub struct History {
     conn: Connection,
+    /// The last fitted calibration and when it was fitted.
+    scale: Option<(i64, PercentScale)>,
 }
 
 impl History {
@@ -98,7 +117,7 @@ impl History {
             tx.execute("ALTER TABLE battery_samples ADD COLUMN full_charge_mah INTEGER", [])?;
         }
         tx.commit()?;
-        Ok(Self { conn })
+        Ok(Self { conn, scale: None })
     }
 
     /// Returns whether the sample was stored.
@@ -148,19 +167,40 @@ impl History {
         self.conn.execute("DELETE FROM battery_samples WHERE ts < ?1", [ts])
     }
 
-    /// The samples of the last `chart_secs`, and the drain estimate, which
-    /// reads the last `ESTIMATE_LOOKBACK_SECS` whatever range the chart shows.
-    pub fn chart_and_estimate(
-        &self,
-        now: i64,
-        chart_secs: i64,
-    ) -> rusqlite::Result<(Vec<BatterySample>, Result<DischargeEstimate, String>)> {
+    /// The samples of the last `chart_secs`, the drain estimate and the usual
+    /// drain, which read the last `ESTIMATE_LOOKBACK_SECS` whatever range the chart shows.
+    pub fn chart_and_estimate(&mut self, now: i64, chart_secs: i64) -> rusqlite::Result<Drain> {
         let (chart_from, estimate_from) = (now - chart_secs, now - ESTIMATE_LOOKBACK_SECS);
         let all = self.since(chart_from.min(estimate_from))?;
         let from = |ts: i64| all.partition_point(|s| s.ts < ts);
-        let estimate = estimate_discharge(&all[from(estimate_from)..], now);
-        Ok((all[from(chart_from)..].to_vec(), estimate))
+        let recent = &all[from(estimate_from)..];
+        let scale = percent_scale(recent);
+        self.scale = Some((now, scale.unwrap_or(PercentScale::GAUGE)));
+        Ok(Drain {
+            estimate: estimate_discharge(recent, now, scale),
+            usual: usual_drain(recent, scale.unwrap_or(PercentScale::GAUGE)),
+            samples: all[from(chart_from)..].to_vec(),
+        })
     }
+
+    /// The calibration from the gauge to the percentage macOS shows, refitted
+    /// every `SCALE_REFIT_SECS`.
+    pub fn scale(&mut self, now: i64) -> rusqlite::Result<PercentScale> {
+        match self.scale {
+            Some((at, scale)) if (0..SCALE_REFIT_SECS).contains(&(now - at)) => Ok(scale),
+            _ => {
+                let scale = percent_scale(&self.since(now - ESTIMATE_LOOKBACK_SECS)?).unwrap_or(PercentScale::GAUGE);
+                self.scale = Some((now, scale));
+                Ok(scale)
+            }
+        }
+    }
+}
+
+pub struct Drain {
+    pub samples: Vec<BatterySample>,
+    pub estimate: Result<DischargeEstimate, String>,
+    pub usual: Option<UsualDrain>,
 }
 
 /// macOS's battery percentage as a straight line in the gauge's share of its
@@ -169,7 +209,7 @@ impl History {
 /// share does. Fitting the share, not mAh, keeps the line when the gauge
 /// relearns its full charge.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct PercentScale {
+pub struct PercentScale {
     /// Points of macOS's percentage per point of the gauge's share.
     slope: f64,
     share_at_zero: f64,
@@ -181,6 +221,15 @@ impl PercentScale {
 
     fn percent(self, share: f64) -> f64 {
         self.slope * (share - self.share_at_zero)
+    }
+
+    /// A current in mA as points of macOS's percentage per hour.
+    pub fn percent_per_hour(self, ma: f64, full_mah: u32) -> f64 {
+        self.slope * gauge_share(ma, full_mah)
+    }
+
+    pub fn is_fitted(self) -> bool {
+        self != Self::GAUGE
     }
 }
 
@@ -223,13 +272,13 @@ fn gauge_confidence(gauge_minutes: f64) -> (Confidence, String) {
 /// recent unbroken run of samples on battery power. Every sample on battery
 /// calibrates the gauge against the percentage. Returns a plain-language
 /// reason when it cannot.
-fn estimate_discharge(samples: &[BatterySample], now: i64) -> Result<DischargeEstimate, String> {
+fn estimate_discharge(samples: &[BatterySample], now: i64, fitted: Option<PercentScale>) -> Result<DischargeEstimate, String> {
     let Some(latest) = samples.last() else {
-        return Err("No battery samples yet.".into());
+        return Err("No readings yet.".into());
     };
     if now - latest.ts > MAX_SAMPLE_GAP_SECS {
         return Err(format!(
-            "No battery reading in the last {} min, so there is no current rate. Readings pause while the Mac sleeps or MacPilot is closed, and the estimate resumes with the next one.",
+            "No reading in the last {} min; readings pause while the Mac sleeps or MacPilot is closed.",
             (now - latest.ts) / 60
         ));
     }
@@ -246,15 +295,15 @@ fn estimate_discharge(samples: &[BatterySample], now: i64) -> Result<DischargeEs
     }
     let run = &samples[start..];
     if run.is_empty() {
-        return Err("Not running on battery, so there is no discharge to measure.".into());
+        return Err("Not on battery.".into());
     }
     let (first, last) = (&run[0], &run[run.len() - 1]);
     let window_secs = last.ts - first.ts;
     if run.len() < MIN_SAMPLES || window_secs < MIN_WINDOW_SECS {
         return Err(format!(
-            "Collecting data: {} min of unplugged history so far, {} min needed.",
-            window_secs / 60,
-            MIN_WINDOW_SECS / 60
+            "Shown after {} min on battery; {} min so far.",
+            MIN_WINDOW_SECS / 60,
+            window_secs / 60
         ));
     }
 
@@ -283,7 +332,7 @@ fn estimate_discharge(samples: &[BatterySample], now: i64) -> Result<DischargeEs
         ),
         (Some((gauge_minutes, ma, held)), Some(full)) => {
             let (confidence, reason) = gauge_confidence(gauge_minutes);
-            let (scale, reason) = match percent_scale(samples) {
+            let (scale, reason) = match fitted {
                 Some(scale) => (scale, reason),
                 None => (
                     PercentScale::GAUGE,
@@ -323,6 +372,29 @@ fn estimate_discharge(samples: &[BatterySample], now: i64) -> Result<DischargeEs
     })
 }
 
+/// The gauge's fall between consecutive samples on battery, in the
+/// percentage macOS shows, over the time those samples span. Gaps (sleep,
+/// MacPilot closed) are left out.
+fn usual_drain(samples: &[BatterySample], scale: PercentScale) -> Option<UsualDrain> {
+    let (mut points, mut secs) = (0.0, 0);
+    for pair in samples.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        let on_battery = |s: &BatterySample| !s.charging && !s.external_power;
+        if !on_battery(a) || !on_battery(b) || b.ts - a.ts > MAX_SAMPLE_GAP_SECS {
+            continue;
+        }
+        let share = |s: &BatterySample| Some(gauge_share(f64::from(s.charge_mah?), s.full_charge_mah.filter(|f| *f > 0)?));
+        if let (Some(from), Some(to)) = (share(a), share(b)) {
+            points += scale.slope * (from - to);
+            secs += b.ts - a.ts;
+        }
+    }
+    (secs >= MIN_USUAL_SECS && points > 0.0).then(|| UsualDrain {
+        percent_per_hour: round2(points / (secs as f64 / 3600.0)),
+        hours: (secs as f64 / 360.0).round() / 10.0,
+    })
+}
+
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
 }
@@ -350,7 +422,7 @@ mod tests {
 
     /// Estimates as of the newest sample.
     fn estimate(samples: &[BatterySample]) -> Result<DischargeEstimate, String> {
-        estimate_discharge(samples, samples.last().map_or(0, |s| s.ts))
+        estimate_discharge(samples, samples.last().map_or(0, |s| s.ts), percent_scale(samples))
     }
 
     /// Six hours unplugged, as recorded on an M1 Pro with a 7637 mAh full
@@ -486,7 +558,7 @@ mod tests {
 
     #[test]
     fn estimate_reads_the_whole_run_whatever_the_chart_range() {
-        let h = History::open_in_memory().unwrap();
+        let mut h = History::open_in_memory().unwrap();
         let mut samples = macos_run(1_000_000, 7637);
         samples.insert(0, BatterySample { charging: true, external_power: true, ..samples[0].clone() });
         samples[0].ts -= 60;
@@ -494,18 +566,50 @@ mod tests {
             assert!(h.insert(s).unwrap());
         }
         let now = samples.last().unwrap().ts + 30;
-        let (hour, from_hour) = h.chart_and_estimate(now, 3600).unwrap();
-        let (_, from_day) = h.chart_and_estimate(now, 24 * 3600).unwrap();
-        assert_eq!(hour.len(), 60);
-        assert_eq!(from_hour, from_day);
-        assert_eq!(from_hour.unwrap().window_minutes, 360.0);
+        let hour = h.chart_and_estimate(now, 3600).unwrap();
+        let day = h.chart_and_estimate(now, 24 * 3600).unwrap();
+        assert_eq!(hour.samples.len(), 60);
+        assert_eq!(hour.estimate, day.estimate);
+        assert_eq!(hour.estimate.unwrap().window_minutes, 360.0);
+    }
+
+    #[test]
+    fn usual_drain_spans_runs_but_not_gaps_or_charging() {
+        let mut samples = macos_run(1_000_000, 7637);
+        // A night asleep, a charge, then another run.
+        samples.push(BatterySample { charging: true, external_power: true, ..samples[0].clone() });
+        samples.last_mut().unwrap().ts += 6 * 3600 + 60;
+        samples.extend(macos_run(1_000_000 + 8 * 3600, 7637));
+        let scale = percent_scale(&samples).unwrap();
+        let usual = usual_drain(&samples, scale).unwrap();
+        assert_eq!(usual.hours, 12.0);
+        assert!((usual.percent_per_hour - 577.0 * 0.014_06).abs() < 0.05, "{usual:?}");
+        // An hour on battery is too little to call usual.
+        assert_eq!(usual_drain(&samples[..61], scale), None);
+    }
+
+    #[test]
+    fn scale_is_cached_between_refits() {
+        let mut h = History::open_in_memory().unwrap();
+        let now = 2_000_000;
+        assert_eq!(h.scale(now).unwrap(), PercentScale::GAUGE);
+        assert!(!h.scale(now).unwrap().is_fitted());
+        for s in macos_run(now - 7 * 3600, 7637) {
+            h.insert(&s).unwrap();
+        }
+        // Still the cached gauge scale within the refit interval.
+        assert_eq!(h.scale(now + 60).unwrap(), PercentScale::GAUGE);
+        let fitted = h.scale(now + SCALE_REFIT_SECS).unwrap();
+        assert!((fitted.slope - 1.0738).abs() < 0.01, "{fitted:?}");
+        // Drain now from a current: 577 mA on the 7637 mAh gauge.
+        assert!((fitted.percent_per_hour(577.0, 7637) - 577.0 * 0.014_06).abs() < 0.05);
     }
 
     #[test]
     fn no_current_rate_after_a_long_silence() {
         let samples = macos_run(1_000_000, 7637);
         let now = samples.last().unwrap().ts + 20 * 60;
-        let err = estimate_discharge(&samples, now).unwrap_err();
+        let err = estimate_discharge(&samples, now, percent_scale(&samples)).unwrap_err();
         assert!(err.contains("last 20 min"), "{err}");
     }
 

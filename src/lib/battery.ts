@@ -27,16 +27,6 @@ export function externalPowerRanges(
   return ranges;
 }
 
-/** Keeps at most one sample per `stepSecs`, newest first, for the table view. */
-export function thinSamples(samples: BatterySample[], stepSecs: number): BatterySample[] {
-  const out: BatterySample[] = [];
-  for (let i = samples.length - 1; i >= 0; i--) {
-    const s = samples[i];
-    if (out.length === 0 || out[out.length - 1].ts - s.ts >= stepSecs) out.push(s);
-  }
-  return out;
-}
-
 export function isHealthyCondition(condition: string): boolean {
   return condition.trim().toLowerCase() === "normal";
 }

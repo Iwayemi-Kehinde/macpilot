@@ -1,16 +1,13 @@
-//! CPU, memory, disk, network and process metrics. `sysinfo` reads the native
-//! Mach and BSD interfaces; `macos` and `processes` cover what it does not.
+//! CPU, memory, disk, network, heat and per-app metrics. `sysinfo` reads the
+//! native Mach and BSD interfaces; `macos` and `processes` cover what it does not.
 
-use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use crate::macos::{Kernel, MemoryBreakdown};
-use crate::processes::{self, CpuRates, Sample};
+use crate::apps::{self, AppSummary};
+use crate::macos::{self, Kernel, MemoryPressure, ThermalPressure};
+use crate::processes::{self, Rates, Sample};
 use sysinfo::{DiskRefreshKind, Disks, Networks, System, MINIMUM_CPU_UPDATE_INTERVAL};
-
-const TOP_PROCESSES: usize = 12;
 
 /// Rates averaged over a longer window than this describe the past, not now
 /// (the window was hidden or the Mac slept), so they are withheld for a sample.
@@ -18,15 +15,16 @@ const MAX_RATE_WINDOW: Duration = Duration::from_secs(15);
 /// Free space changes slowly, and reading it costs more than the rest of a
 /// snapshot together, so it is re-read this often or when a volume comes or goes.
 const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// Wi-Fi and Ethernet. Tunnels, loopback and AirDrop links carry traffic that
+/// also crosses these, or never leaves the Mac.
+const PHYSICAL_INTERFACE_PREFIX: &str = "en";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostInfo {
     pub hostname: Option<String>,
     pub os_version: Option<String>,
-    pub kernel_version: Option<String>,
     pub cpu_brand: Option<String>,
-    pub physical_cores: Option<usize>,
     pub logical_cores: usize,
 }
 
@@ -36,70 +34,37 @@ pub struct CpuMetrics {
     /// A rate between two refreshes at least 0.2 s apart. Snapshots always
     /// measure one; `None` stays in the format so readers handle a missing rate.
     pub usage_percent: Option<f32>,
-    pub per_core_percent: Vec<f32>,
-    pub load_average: [f64; 3],
+    pub thermal: Option<ThermalPressure>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryMetrics {
     pub total_bytes: u64,
-    /// Activity Monitor's "Memory Used" (see `macos::Memory`), or sysinfo's
-    /// figure if the kernel did not answer, in which case `breakdown` is `None`.
+    /// Activity Monitor's "Memory Used", or sysinfo's figure if the kernel did not answer.
     pub used_bytes: u64,
-    pub breakdown: Option<MemoryBreakdown>,
+    pub pressure: Option<MemoryPressure>,
     pub swap_total_bytes: u64,
     pub swap_used_bytes: u64,
 }
 
+/// The startup volume.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiskMetrics {
     pub name: String,
-    pub mount_point: String,
-    pub file_system: String,
     pub total_bytes: u64,
+    /// Finder's figure, which counts purgeable files.
     pub available_bytes: u64,
-    pub removable: bool,
 }
 
+/// Traffic through Wi-Fi and Ethernet.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkMetrics {
-    pub interface: String,
     /// See `CpuMetrics::usage_percent`.
     pub rx_bytes_per_sec: Option<f64>,
     pub tx_bytes_per_sec: Option<f64>,
-    pub total_rx_bytes: u64,
-    pub total_tx_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProcessMetrics {
-    pub pid: u32,
-    pub name: String,
-    /// Percent of one core, so values above 100 are possible. `None` for a
-    /// process that started since the previous reading.
-    pub cpu_percent: Option<f32>,
-    /// Physical footprint, as in Activity Monitor's Memory column. `None` for
-    /// system processes: macOS shows their memory only to administrator tools.
-    pub memory_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProcessSummary {
-    /// Processes `ps` lists; kernel_task is hidden from apps.
-    pub total: usize,
-    /// Processes of macOS and other users, whose memory macOS shows only to
-    /// administrator tools. They are ranked by CPU only.
-    pub system: usize,
-    /// Why there is no process list, if `ps` failed.
-    pub error: Option<String>,
-    pub top_by_cpu: Vec<ProcessMetrics>,
-    /// This user's processes only, since the others have no readable memory.
-    pub top_by_memory: Vec<ProcessMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,15 +75,15 @@ pub struct SystemSnapshot {
     pub host: HostInfo,
     pub cpu: CpuMetrics,
     pub memory: MemoryMetrics,
-    pub disks: Vec<DiskMetrics>,
-    pub network: Vec<NetworkMetrics>,
-    pub processes: ProcessSummary,
+    pub disk: Option<DiskMetrics>,
+    pub network: NetworkMetrics,
+    pub apps: AppSummary,
 }
 
 pub struct Monitor {
     sys: System,
     kernel: Kernel,
-    cpu_rates: CpuRates,
+    rates: Rates,
     disks: Disks,
     networks: Networks,
     host: HostInfo,
@@ -158,15 +123,13 @@ impl Monitor {
         let host = HostInfo {
             hostname: System::host_name(),
             os_version: System::long_os_version(),
-            kernel_version: System::kernel_version(),
             cpu_brand: sys.cpus().first().map(|c| c.brand().trim().to_string()).filter(|b| !b.is_empty()),
-            physical_cores: System::physical_core_count(),
             logical_cores: sys.cpus().len(),
         };
         Self {
             sys,
             kernel: Kernel::new(),
-            cpu_rates: CpuRates::new(MAX_RATE_WINDOW),
+            rates: Rates::new(MAX_RATE_WINDOW),
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
             host,
@@ -210,78 +173,51 @@ impl Monitor {
                 // Process rates must not span the gap either: forget the old
                 // readings, then take a baseline. If ps fails here, the read
                 // that follows reports it.
-                self.cpu_rates.reset();
+                self.rates.reset();
                 if let Ok(samples) = self.read_counters() {
-                    self.cpu_rates.update(&samples);
+                    self.rates.update(&samples);
                 }
                 std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
             }
         }
         let window_secs = self.counters_read.map(|s| s.mono.elapsed().as_secs_f64());
-        let processes = match self.read_counters() {
+        let apps = match self.read_counters() {
             Ok(samples) => {
-                let rates = self.cpu_rates.update(&samples);
-                summarize(samples, rates)
+                let rates = self.rates.update(&samples);
+                apps::summarize(&samples, &rates, unsafe { libc::getuid() })
             }
-            Err(error) => ProcessSummary { error: Some(error), ..ProcessSummary::default() },
+            Err(error) => AppSummary { error: Some(error), ..AppSummary::default() },
         };
         self.sys.refresh_memory();
         self.refresh_disks();
 
-        let load = System::load_average();
-        let cpu = CpuMetrics {
-            usage_percent: Some(self.sys.global_cpu_usage()),
-            per_core_percent: self.sys.cpus().iter().map(|c| c.cpu_usage()).collect(),
-            load_average: [load.one, load.five, load.fifteen],
-        };
+        let cpu = CpuMetrics { usage_percent: Some(self.sys.global_cpu_usage()), thermal: self.kernel.thermal_pressure() };
 
-        let kernel_memory = self.kernel.memory();
         let memory = MemoryMetrics {
             total_bytes: self.sys.total_memory(),
-            used_bytes: kernel_memory.map_or_else(|| self.sys.used_memory(), |m| m.used_bytes),
-            breakdown: kernel_memory.map(|m| m.breakdown),
+            used_bytes: self.kernel.memory_used().unwrap_or_else(|| self.sys.used_memory()),
+            pressure: macos::memory_pressure(),
             swap_total_bytes: self.sys.total_swap(),
             swap_used_bytes: self.sys.used_swap(),
         };
 
-        // APFS volumes in one container (`/` and `/System/Volumes/Data`) share a
-        // name and capacity; keep the first so space is not double counted. Free
-        // space is not part of the key because the two are read moments apart
-        // and differ by a few bytes whenever something writes to disk.
-        let mut seen = HashSet::new();
-        let disks = self
-            .disks
-            .list()
+        // `/` and `/System/Volumes/Data` share one APFS container, and `/`
+        // reports the space Finder shows for it.
+        let disks = self.disks.list();
+        let disk = ["/", "/System/Volumes/Data"]
             .iter()
-            .filter(|d| seen.insert((d.name().to_os_string(), d.total_space())))
+            .find_map(|mount| disks.iter().find(|d| d.mount_point().as_os_str() == *mount))
             .map(|d| DiskMetrics {
                 name: d.name().to_string_lossy().into_owned(),
-                mount_point: d.mount_point().to_string_lossy().into_owned(),
-                file_system: d.file_system().to_string_lossy().into_owned(),
                 total_bytes: d.total_space(),
                 available_bytes: d.available_space(),
-                removable: d.is_removable(),
-            })
-            .collect();
+            });
 
-        let mut network: Vec<NetworkMetrics> = self
-            .networks
-            .list()
-            .iter()
-            .filter(|(_, n)| n.total_received() + n.total_transmitted() > 0)
-            .map(|(name, n)| NetworkMetrics {
-                interface: name.clone(),
-                rx_bytes_per_sec: window_secs.map(|s| n.received() as f64 / s),
-                tx_bytes_per_sec: window_secs.map(|s| n.transmitted() as f64 / s),
-                total_rx_bytes: n.total_received(),
-                total_tx_bytes: n.total_transmitted(),
-            })
-            .collect();
-        network.sort_by(|a, b| {
-            (b.total_rx_bytes + b.total_tx_bytes)
-                .cmp(&(a.total_rx_bytes + a.total_tx_bytes))
-                .then_with(|| a.interface.cmp(&b.interface))
-        });
+        let physical = || self.networks.list().iter().filter(|(name, _)| name.starts_with(PHYSICAL_INTERFACE_PREFIX)).map(|(_, n)| n);
+        let network = NetworkMetrics {
+            rx_bytes_per_sec: window_secs.map(|s| physical().map(|n| n.received()).sum::<u64>() as f64 / s),
+            tx_bytes_per_sec: window_secs.map(|s| physical().map(|n| n.transmitted()).sum::<u64>() as f64 / s),
+        };
 
         SystemSnapshot {
             timestamp_ms: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
@@ -289,40 +225,11 @@ impl Monitor {
             host: self.host.clone(),
             cpu,
             memory,
-            disks,
+            disk,
             network,
-            processes,
+            apps,
         }
     }
-}
-
-fn summarize(samples: Vec<Sample>, rates: Vec<Option<f32>>) -> ProcessSummary {
-    let all: Vec<ProcessMetrics> = samples
-        .into_iter()
-        .zip(rates)
-        .map(|(s, cpu_percent)| ProcessMetrics { pid: s.pid, name: s.name, cpu_percent, memory_bytes: s.footprint_bytes })
-        .collect();
-    ProcessSummary {
-        total: all.len(),
-        system: all.iter().filter(|p| p.memory_bytes.is_none()).count(),
-        error: None,
-        // Only measured processes are ranked; one without a rate is not idle.
-        top_by_cpu: top_n(all.iter().filter(|p| p.cpu_percent.is_some()), |a, b| {
-            b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(Ordering::Equal).then(a.pid.cmp(&b.pid))
-        }),
-        top_by_memory: top_n(all.iter().filter(|p| p.memory_bytes.is_some()), |a, b| {
-            b.memory_bytes.cmp(&a.memory_bytes).then(a.pid.cmp(&b.pid))
-        }),
-    }
-}
-
-fn top_n<'a>(
-    candidates: impl Iterator<Item = &'a ProcessMetrics>,
-    cmp: impl Fn(&ProcessMetrics, &ProcessMetrics) -> Ordering,
-) -> Vec<ProcessMetrics> {
-    let mut sorted: Vec<_> = candidates.collect();
-    sorted.sort_by(|a, b| cmp(a, b));
-    sorted.into_iter().take(TOP_PROCESSES).cloned().collect()
 }
 
 #[cfg(test)]
@@ -336,48 +243,31 @@ mod tests {
         let mut m = Monitor::new();
         let first = m.snapshot();
         assert!(first.cpu.usage_percent.is_some());
-        assert!(first.network.iter().all(|n| n.rx_bytes_per_sec.is_some()));
-        assert!(!first.processes.top_by_cpu.is_empty());
+        assert!(first.network.rx_bytes_per_sec.is_some() && first.network.tx_bytes_per_sec.is_some());
+        assert!(first.apps.apps.iter().any(|a| a.cpu_percent.is_some()));
         assert!(first.memory.total_bytes > 0);
         assert!(first.memory.used_bytes <= first.memory.total_bytes);
-        let mounts: Vec<_> = first.disks.iter().map(|d| d.mount_point.as_str()).collect();
-        assert!(!(mounts.contains(&"/") && mounts.contains(&"/System/Volumes/Data")), "{mounts:?}");
-        assert!(first.processes.total > 0);
+        assert!(first.memory.pressure.is_some() && first.cpu.thermal.is_some());
+        let disk = first.disk.as_ref().expect("startup volume");
+        assert!(disk.available_bytes <= disk.total_bytes && disk.total_bytes > 0);
+        assert!(first.apps.total_processes > 0);
         assert!(first.host.logical_cores > 0);
 
         let started = Instant::now();
         let second = m.snapshot();
         assert!(started.elapsed() >= MINIMUM_CPU_UPDATE_INTERVAL / 2, "waited {:?}", started.elapsed());
         let usage = second.cpu.usage_percent.expect("cpu usage after the minimum interval");
-        let b = second.memory.breakdown.expect("kernel memory statistics");
-        assert!(b.app_bytes + b.wired_bytes + b.compressed_bytes <= second.memory.used_bytes);
         assert!((0.0..=100.0).contains(&usage));
-        assert_eq!(second.cpu.per_core_percent.len(), second.host.logical_cores);
-        assert!(second.network.iter().all(|n| n.rx_bytes_per_sec.is_some()));
+        assert!(second.network.rx_bytes_per_sec.is_some());
 
-        let procs = &second.processes;
-        assert!(!procs.top_by_cpu.is_empty() && procs.top_by_cpu.len() <= TOP_PROCESSES);
-        assert!(procs.system > 0 && procs.system < procs.total);
-        assert_eq!(procs.error, None);
-        assert!(procs.top_by_memory.iter().all(|p| p.memory_bytes.is_some_and(|m| m > 0)));
-        let footprints: Vec<u64> = procs.top_by_memory.iter().filter_map(|p| p.memory_bytes).collect();
-        assert!(footprints.windows(2).all(|w| w[0] >= w[1]), "{footprints:?}");
-        let cpus: Vec<f32> = procs.top_by_cpu.iter().map(|p| p.cpu_percent.unwrap()).collect();
+        let apps = &second.apps;
+        assert_eq!(apps.error, None);
+        assert!(apps.system_processes > 0 && apps.system_processes < apps.total_processes);
+        let cpus: Vec<f32> = apps.apps.iter().filter_map(|a| a.cpu_percent).collect();
         assert!(cpus.windows(2).all(|w| w[0] >= w[1]), "{cpus:?}");
-    }
-
-    #[test]
-    fn summary_ranks_measured_processes_and_counts_system_ones() {
-        let at = Instant::now();
-        let sample = |pid, footprint_bytes| Sample { pid, uid: 0, name: format!("p{pid}"), cpu_secs: 0.0, at, footprint_bytes };
-        let samples = vec![sample(1, None), sample(2, Some(10)), sample(3, Some(30)), sample(4, None)];
-        let s = summarize(samples, vec![Some(5.0), None, Some(1.0), Some(9.0)]);
-        assert_eq!((s.total, s.system, s.error), (4, 2, None));
-        let pids = |rows: &[ProcessMetrics]| rows.iter().map(|p| p.pid).collect::<Vec<_>>();
-        // A process without a rate yet is not ranked as idle.
-        assert_eq!(pids(&s.top_by_cpu), [4, 1, 3]);
-        // System processes have no readable memory, so they are not ranked by it.
-        assert_eq!(pids(&s.top_by_memory), [3, 2]);
+        assert!(apps.apps.iter().any(|a| a.power_w.is_some()), "no app with a power reading");
+        // This test binary is one of this user's processes.
+        assert!(apps.apps.iter().filter(|a| a.own_process_count > 0).all(|a| a.memory_bytes.is_some()));
     }
 
     #[test]

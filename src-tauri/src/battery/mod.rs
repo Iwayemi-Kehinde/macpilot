@@ -35,6 +35,7 @@ pub enum TimeKind {
 #[serde(rename_all = "camelCase")]
 pub struct BatteryInfo {
     pub present: bool,
+    #[serde(skip)]
     pub power_source: Option<String>,
     pub percent: Option<u8>,
     pub state: ChargeState,
@@ -42,21 +43,32 @@ pub struct BatteryInfo {
     pub time_remaining_min: Option<u32>,
     pub time_remaining_kind: Option<TimeKind>,
     pub cycle_count: Option<u32>,
-    pub design_capacity_mah: Option<u32>,
-    pub full_charge_capacity_mah: Option<u32>,
-    pub current_charge_mah: Option<u32>,
-    /// Full-charge capacity divided by design capacity, from raw gauge values.
-    pub raw_capacity_percent: Option<f64>,
     /// "Maximum Capacity" exactly as macOS reports it in System Settings.
     pub apple_max_capacity_percent: Option<u8>,
     pub condition: Option<String>,
-    pub voltage_mv: Option<u32>,
-    pub amperage_ma: Option<i64>,
-    /// Instantaneous power; negative while the battery is draining.
-    pub power_w: Option<f64>,
     pub temperature_c: Option<f64>,
+    /// What the whole Mac draws right now, screen included.
+    pub system_power_w: Option<f64>,
+    /// What the adapter supplies; 0 on battery.
+    pub adapter_power_w: Option<f64>,
+    /// Into the battery while positive, out of it while negative.
+    pub battery_power_w: Option<f64>,
+    pub adapter_rating_w: Option<u32>,
+    /// On battery, the drain the gauge's present current amounts to, in the
+    /// percentage macOS shows per hour. Set from the history's calibration.
+    pub drain_percent_per_hour: Option<f64>,
+    /// False while the drain is the gauge's share, before there is enough history to calibrate.
+    pub drain_calibrated: bool,
     /// Why specific values are missing, in plain language.
     pub notes: Vec<String>,
+    #[serde(skip)]
+    pub full_charge_capacity_mah: Option<u32>,
+    #[serde(skip)]
+    pub current_charge_mah: Option<u32>,
+    #[serde(skip)]
+    pub voltage_mv: Option<u32>,
+    #[serde(skip)]
+    pub amperage_ma: Option<i64>,
 }
 
 pub fn combine(
@@ -78,17 +90,20 @@ pub fn combine(
             time_remaining_min: None,
             time_remaining_kind: None,
             cycle_count: None,
-            design_capacity_mah: None,
-            full_charge_capacity_mah: None,
-            current_charge_mah: None,
-            raw_capacity_percent: None,
             apple_max_capacity_percent: None,
             condition: None,
+            temperature_c: None,
+            system_power_w: io.system_load_mw.map(milliwatts),
+            adapter_power_w: io.adapter_input_mw.map(milliwatts),
+            battery_power_w: None,
+            adapter_rating_w: io.adapter_watts,
+            drain_percent_per_hour: None,
+            drain_calibrated: false,
+            notes,
+            full_charge_capacity_mah: None,
+            current_charge_mah: None,
             voltage_mv: None,
             amperage_ma: None,
-            power_w: None,
-            temperature_c: None,
-            notes,
         };
     }
 
@@ -100,24 +115,22 @@ pub fn combine(
     if time_remaining_kind.is_some() && pm.time_remaining_min.is_none() {
         notes.push("macOS has not produced a time estimate yet.".to_string());
     }
-
-    let raw_capacity_percent = match (io.full_charge_capacity_mah, io.design_capacity_mah) {
-        (Some(full), Some(design)) => Some(round1(full as f64 / design as f64 * 100.0)),
-        _ => {
-            notes.push("Raw capacity ratio unavailable: ioreg did not report both capacities.".to_string());
-            None
-        }
-    };
     if prof.max_capacity_percent.is_none() {
         notes.push("Apple's maximum-capacity figure was not reported by system_profiler.".to_string());
     }
 
-    let power_w = match (io.voltage_mv, io.amperage_ma) {
-        (Some(v), Some(a)) => Some(round2(v as f64 * a as f64 / 1_000_000.0)),
+    // The telemetry counters, or voltage times current where they are missing.
+    let battery_power_w = io.battery_power_mw.map(|mw| mw as f64 / 1000.0).or_else(|| match (io.voltage_mv, io.amperage_ma) {
+        (Some(v), Some(a)) => Some(v as f64 * a as f64 / 1_000_000.0),
         _ => None,
-    };
-    if power_w.is_none() {
-        notes.push("Power draw unavailable: voltage or current not reported.".to_string());
+    });
+    let on_battery = io.external_connected == Some(false);
+    let system_power_w = io
+        .system_load_mw
+        .map(milliwatts)
+        .or_else(|| battery_power_w.filter(|w| on_battery && *w <= 0.0).map(f64::abs));
+    if system_power_w.is_none() {
+        notes.push("The Mac's power draw was not reported by the battery's power telemetry.".to_string());
     }
     if io.temperature_c.is_none() {
         notes.push("Battery temperature not reported.".to_string());
@@ -132,22 +145,25 @@ pub fn combine(
         time_remaining_min: time_remaining_kind.and(pm.time_remaining_min),
         time_remaining_kind,
         cycle_count: io.cycle_count,
-        design_capacity_mah: io.design_capacity_mah,
-        full_charge_capacity_mah: io.full_charge_capacity_mah,
-        current_charge_mah: io.current_charge_mah,
-        raw_capacity_percent,
         apple_max_capacity_percent: prof.max_capacity_percent,
         condition: prof.condition.clone(),
+        temperature_c: io.temperature_c,
+        system_power_w: system_power_w.map(round2),
+        adapter_power_w: io.adapter_input_mw.map(milliwatts),
+        battery_power_w: battery_power_w.map(round2),
+        adapter_rating_w: io.adapter_watts.filter(|_| io.external_connected != Some(false)),
+        drain_percent_per_hour: None,
+        drain_calibrated: false,
+        notes,
+        full_charge_capacity_mah: io.full_charge_capacity_mah,
+        current_charge_mah: io.current_charge_mah,
         voltage_mv: io.voltage_mv,
         amperage_ma: io.amperage_ma,
-        power_w,
-        temperature_c: io.temperature_c,
-        notes,
     }
 }
 
-fn round1(v: f64) -> f64 {
-    (v * 10.0).round() / 10.0
+fn milliwatts(mw: u64) -> f64 {
+    round2(mw as f64 / 1000.0)
 }
 
 fn round2(v: f64) -> f64 {
@@ -213,12 +229,31 @@ mod tests {
         assert_eq!(b.percent, Some(86));
         assert_eq!(b.time_remaining_kind, Some(TimeKind::UntilEmpty));
         assert_eq!(b.time_remaining_min, Some(726));
-        assert_eq!(b.raw_capacity_percent, Some(87.7));
         assert_eq!(b.apple_max_capacity_percent, Some(85));
         assert_eq!(b.condition.as_deref(), Some("Normal"));
-        // 12.106 V x -1.024 A
-        assert_eq!(b.power_w, Some(-12.4));
+        // On battery the Mac's whole draw comes out of the battery.
+        assert_eq!((b.system_power_w, b.adapter_power_w, b.battery_power_w), (Some(11.78), Some(0.0), Some(-11.78)));
+        assert_eq!(b.adapter_rating_w, None);
         assert!(b.notes.is_empty(), "{:?}", b.notes);
+    }
+
+    #[test]
+    fn charging_splits_the_adapter_power_between_the_mac_and_the_battery() {
+        let (_, _, prof) = fixtures();
+        let pm = pmset::parse(" -InternalBattery-0 (id=1)\t99%; charging; 0:20 remaining present: true\n");
+        let b = combine(&pm, &ioreg::parse(include_str!("../../tests/fixtures/ioreg_battery_d1.txt")), &prof);
+        assert_eq!((b.adapter_power_w, b.system_power_w, b.battery_power_w), (Some(14.32), Some(9.15), Some(5.17)));
+        assert_eq!(b.adapter_rating_w, Some(61));
+        assert_eq!(b.time_remaining_kind, Some(TimeKind::UntilFull));
+    }
+
+    #[test]
+    fn power_falls_back_to_voltage_times_current() {
+        let (pm, mut io, prof) = fixtures();
+        (io.system_load_mw, io.battery_power_mw) = (None, None);
+        let b = combine(&pm, &io, &prof);
+        // 12.106 V x -1.024 A, all of it drawn by the Mac.
+        assert_eq!((b.battery_power_w, b.system_power_w), (Some(-12.4), Some(12.4)));
     }
 
     #[test]
@@ -226,9 +261,8 @@ mod tests {
         let (pm, _, _) = fixtures();
         let b = combine(&pm, &ioreg::IoregBattery::default(), &profiler::ProfilerBattery::default());
         assert_eq!(b.cycle_count, None);
-        assert_eq!(b.raw_capacity_percent, None);
-        assert_eq!(b.power_w, None);
-        assert_eq!(b.notes.len(), 4);
+        assert_eq!((b.system_power_w, b.battery_power_w), (None, None));
+        assert_eq!(b.notes.len(), 3, "{:?}", b.notes);
     }
 
     /// Every prefix of real output (a truncated read) and pseudo-random bytes

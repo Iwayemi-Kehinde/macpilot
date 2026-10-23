@@ -49,3 +49,15 @@ export function formatClockSeconds(ms: number): string {
 export function formatDayClock(ms: number): string {
   return new Date(ms).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
 }
+
+export function formatWatts(w: number): string {
+  if (!Number.isFinite(w)) return "-";
+  const a = Math.abs(w);
+  if (a < 0.01) return a === 0 ? "0 W" : "<0.01 W";
+  return `${a < 1 ? a.toFixed(2) : a < 100 ? a.toFixed(1) : a.toFixed(0)} W`;
+}
+
+/** "a", "a and b", "a, b and c". */
+export function formatList(items: string[]): string {
+  return items.length <= 1 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}

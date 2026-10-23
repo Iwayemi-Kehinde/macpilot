@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { externalPowerRanges, isHealthyCondition, thinSamples } from "./battery";
+import { externalPowerRanges, isHealthyCondition } from "./battery";
 import type { BatterySample } from "./schemas";
 
 const sample = (ts: number, externalPower: boolean): BatterySample => ({
@@ -7,10 +7,6 @@ const sample = (ts: number, externalPower: boolean): BatterySample => ({
   percent: 50,
   charging: externalPower,
   externalPower,
-  chargeMah: null,
-  fullChargeMah: null,
-  amperageMa: null,
-  voltageMv: null,
 });
 
 describe("externalPowerRanges", () => {
@@ -29,13 +25,6 @@ describe("externalPowerRanges", () => {
 
   it("returns nothing when always on battery", () => {
     expect(externalPowerRanges([sample(0, false), sample(60, false)], 900)).toEqual([]);
-  });
-});
-
-describe("thinSamples", () => {
-  it("keeps one sample per step, newest first", () => {
-    const samples = Array.from({ length: 61 }, (_, i) => sample(i * 60, false));
-    expect(thinSamples(samples, 900).map((s) => s.ts)).toEqual([3600, 2700, 1800, 900, 0]);
   });
 });
 
