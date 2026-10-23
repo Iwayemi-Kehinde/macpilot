@@ -117,8 +117,11 @@ export function DiskCard({ s }: { s: Snapshot }) {
                 {d.removable && <span className="tag">Removable or disk image</span>}
               </div>
               <Meter value={d.totalBytes ? used / d.totalBytes : 0} label={`${d.name} used`} />
-              <p className="small muted">
-                {formatBytes(d.availableBytes)} free of {formatBytes(d.totalBytes)} · {d.fileSystem} · {d.mountPoint}
+              <p
+                className="small muted"
+                title="As Finder counts it, with purgeable files macOS removes when it needs room. Volumes that do not report that figure, such as disk images, show plain free space."
+              >
+                {formatBytes(d.availableBytes)} available of {formatBytes(d.totalBytes)} · {d.fileSystem} · {d.mountPoint}
               </p>
             </li>
           );
