@@ -80,11 +80,16 @@ async fn get_battery_history(hours: u32, state: State<'_, AppState>) -> Result<B
     if !(1..=MAX_HISTORY_HOURS).contains(&hours) {
         return Err(format!("hours must be between 1 and {MAX_HISTORY_HOURS}"));
     }
-    let history = state.history.lock().map_err(|_| "history lock poisoned")?;
-    let samples = history
-        .since(now_secs() - i64::from(hours) * 3600)
-        .map_err(|e| format!("could not read battery history: {e}"))?;
-    let (discharge, discharge_unavailable_reason) = match history::estimate_discharge(&samples) {
+    let history = state.history.clone();
+    let (samples, estimate) = blocking(move || {
+        history
+            .lock()
+            .map_err(|_| "history lock poisoned")?
+            .chart_and_estimate(now_secs(), i64::from(hours) * 3600)
+            .map_err(|e| format!("could not read battery history: {e}"))
+    })
+    .await?;
+    let (discharge, discharge_unavailable_reason) = match estimate {
         Ok(e) => (Some(e), None),
         Err(reason) => (None, Some(reason)),
     };

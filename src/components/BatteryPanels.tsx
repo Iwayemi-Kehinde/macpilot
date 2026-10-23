@@ -24,7 +24,7 @@ export function BatteryCard({ state }: { state: PollState<BatteryInfo> }) {
           </div>
           {b.percent !== null && <Meter value={b.percent / 100} label="Battery charge" />}
           <dl className="rows">
-            <Row label={b.timeRemainingKind === "untilFull" ? "Time to full" : "Time remaining"} hint="Estimated by macOS (pmset)">
+            <Row label={b.timeRemainingKind === "untilFull" ? "Time to full" : "Time remaining"} hint="macOS's estimate from recent power use (pmset)">
               {b.timeRemainingMin !== null ? (
                 `${formatMinutes(b.timeRemainingMin)}`
               ) : (
@@ -165,7 +165,7 @@ export function BatteryHistoryCard({ className, externalPower }: { className?: s
             {e ? (
               <>
                 <p>
-                  <strong title="Percent of the battery's current full charge per hour">
+                  <strong title="Battery percentage points per hour; the note below says how they were measured">
                     {e.percentPerHour.toFixed(1)} %/h
                   </strong>
                   {e.averageMa !== null && <span className="muted"> · average {e.averageMa} mA</span>}
