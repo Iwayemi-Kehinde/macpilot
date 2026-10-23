@@ -38,5 +38,5 @@ export function thinSamples(samples: BatterySample[], stepSecs: number): Battery
 }
 
 export function isHealthyCondition(condition: string): boolean {
-  return ["good", "normal"].includes(condition.trim().toLowerCase());
+  return condition.trim().toLowerCase() === "normal";
 }

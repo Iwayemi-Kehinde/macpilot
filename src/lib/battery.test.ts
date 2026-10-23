@@ -40,8 +40,7 @@ describe("thinSamples", () => {
 });
 
 describe("isHealthyCondition", () => {
-  it("treats Good and Normal as healthy", () => {
-    expect(isHealthyCondition("Good")).toBe(true);
+  it("treats Normal as healthy", () => {
     expect(isHealthyCondition("Normal")).toBe(true);
     expect(isHealthyCondition("Service Recommended")).toBe(false);
   });

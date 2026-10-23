@@ -18,7 +18,7 @@ const battery = {
   currentChargeMah: 6230,
   rawCapacityPercent: 87.7,
   appleMaxCapacityPercent: 85,
-  condition: "Good",
+  condition: "Normal",
   voltageMv: 12106,
   amperageMa: -1024,
   powerW: -12.4,

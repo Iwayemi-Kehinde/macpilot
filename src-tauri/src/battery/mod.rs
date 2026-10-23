@@ -215,7 +215,7 @@ mod tests {
         assert_eq!(b.time_remaining_min, Some(726));
         assert_eq!(b.raw_capacity_percent, Some(87.7));
         assert_eq!(b.apple_max_capacity_percent, Some(85));
-        assert_eq!(b.condition.as_deref(), Some("Good"));
+        assert_eq!(b.condition.as_deref(), Some("Normal"));
         // 12.106 V x -1.024 A
         assert_eq!(b.power_w, Some(-12.4));
         assert!(b.notes.is_empty(), "{:?}", b.notes);
