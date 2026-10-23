@@ -122,8 +122,8 @@ pub struct Monitor {
     disks: Disks,
     networks: Networks,
     host: HostInfo,
-    cpu_stamp: Option<Stamp>,
-    net_stamp: Option<Stamp>,
+    /// When the counters behind every rate were last read.
+    counters_read: Option<Stamp>,
     disks_read: Instant,
 }
 
@@ -170,8 +170,7 @@ impl Monitor {
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
             host,
-            cpu_stamp: None,
-            net_stamp: None,
+            counters_read: None,
             disks_read: Instant::now(),
         }
     }
@@ -187,10 +186,19 @@ impl Monitor {
         }
     }
 
+    /// Reads the counters behind every rate back to back, so CPU, network and
+    /// process rates share one window.
+    fn read_counters(&mut self) -> Result<Vec<Sample>, String> {
+        self.counters_read = Some(Stamp::now());
+        self.sys.refresh_cpu_usage();
+        self.networks.refresh(true);
+        processes::read(&self.kernel)
+    }
+
     /// Blocks for up to `MINIMUM_CPU_UPDATE_INTERVAL` when it needs a fresh
     /// rate window, so call it off the async runtime.
     pub fn snapshot(&mut self) -> SystemSnapshot {
-        match self.cpu_stamp.map(|s| (s.mono.elapsed(), s.window())) {
+        match self.counters_read.map(|s| (s.mono.elapsed(), s.window())) {
             // Called again within the minimum interval: wait out the rest.
             Some((elapsed, _)) if elapsed < MINIMUM_CPU_UPDATE_INTERVAL => {
                 std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL - elapsed)
@@ -199,23 +207,18 @@ impl Monitor {
             // First call, or the last one was too long ago (window hidden, Mac
             // asleep) to describe now: take a fresh short sample instead.
             _ => {
-                self.sys.refresh_cpu_usage();
                 // Process rates must not span the gap either: forget the old
                 // readings, then take a baseline. If ps fails here, the read
                 // that follows reports it.
                 self.cpu_rates.reset();
-                if let Ok(samples) = processes::read(&self.kernel) {
+                if let Ok(samples) = self.read_counters() {
                     self.cpu_rates.update(&samples);
                 }
-                self.networks.refresh(true);
-                self.net_stamp = Some(Stamp::now());
                 std::thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
             }
         }
-        self.cpu_stamp = Some(Stamp::now());
-        self.sys.refresh_cpu_usage();
-        // Straight after the CPU refresh, so process rates share its window.
-        let processes = match processes::read(&self.kernel) {
+        let window_secs = self.counters_read.map(|s| s.mono.elapsed().as_secs_f64());
+        let processes = match self.read_counters() {
             Ok(samples) => {
                 let rates = self.cpu_rates.update(&samples);
                 summarize(samples, rates)
@@ -224,11 +227,6 @@ impl Monitor {
         };
         self.sys.refresh_memory();
         self.refresh_disks();
-
-        // Timed on its own so a slow disk refresh does not skew throughput.
-        let net_secs = self.net_stamp.and_then(Stamp::window).map(|d| d.as_secs_f64());
-        self.net_stamp = Some(Stamp::now());
-        self.networks.refresh(true);
 
         let load = System::load_average();
         let cpu = CpuMetrics {
@@ -273,8 +271,8 @@ impl Monitor {
             .filter(|(_, n)| n.total_received() + n.total_transmitted() > 0)
             .map(|(name, n)| NetworkMetrics {
                 interface: name.clone(),
-                rx_bytes_per_sec: net_secs.map(|s| n.received() as f64 / s),
-                tx_bytes_per_sec: net_secs.map(|s| n.transmitted() as f64 / s),
+                rx_bytes_per_sec: window_secs.map(|s| n.received() as f64 / s),
+                tx_bytes_per_sec: window_secs.map(|s| n.transmitted() as f64 / s),
                 total_rx_bytes: n.total_received(),
                 total_tx_bytes: n.total_transmitted(),
             })
